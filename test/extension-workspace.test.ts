@@ -1285,3 +1285,65 @@ test("replaces a closing workspace before Chrome emits its final window removal 
 	expect(h.windows.get(10)?.focused).toBeTrue();
 	expect(h.windows.get(replacement.windowId)?.focused).toBeFalse();
 });
+
+test("focus cleanup failure on a removed tab cannot poison creation in its replacement workspace", async () => {
+	const h = harness();
+	const old = await create(h.workspace);
+	await h.workspace.runRpc({ op: "attach", tabId: old.tabId });
+	const gate = Promise.withResolvers<Record<string, unknown>>();
+	const send = h.api.debugger.sendCommand;
+	let hold = true;
+	h.api.debugger.sendCommand = (target, method, params) => {
+		if (hold && method === "Emulation.setFocusEmulationEnabled" && params?.enabled === false) {
+			hold = false;
+			return gate.promise;
+		}
+		return send(target, method, params);
+	};
+	const stale = h.workspace
+		.runRpc({
+			op: "send",
+			tabId: old.tabId,
+			method: "Emulation.setFocusEmulationEnabled",
+			params: { enabled: false },
+		})
+		.catch((error: unknown) => error);
+	await settle();
+	for (const tab of [...h.tabs.values()].filter(tab => tab.windowId === old.windowId)) {
+		h.tabs.delete(tab.id!);
+		h.events.removed.emit(tab.id!, { windowId: old.windowId, isWindowClosing: true });
+	}
+	const next = create(h.workspace);
+	await settle();
+	gate.reject(new Error(`No tab with given id ${old.tabId}`));
+	expect(await stale).toBeInstanceOf(Error);
+	const replacement = await next;
+	expect(replacement.windowId).not.toBe(old.windowId);
+	expect(h.windows.get(replacement.windowId)?.focused).toBeFalse();
+});
+
+test("a focus transition failure on a still-owned attached tab is not ignored", async () => {
+	const h = harness();
+	const tab = await create(h.workspace);
+	await h.workspace.runRpc({ op: "attach", tabId: tab.tabId });
+	const gate = Promise.withResolvers<Record<string, unknown>>();
+	const send = h.api.debugger.sendCommand;
+	h.api.debugger.sendCommand = (target, method, params) =>
+		method === "Emulation.setFocusEmulationEnabled" && params?.enabled === false
+			? gate.promise
+			: send(target, method, params);
+	const focus = h.workspace
+		.runRpc({
+			op: "send",
+			tabId: tab.tabId,
+			method: "Emulation.setFocusEmulationEnabled",
+			params: { enabled: false },
+		})
+		.catch((error: unknown) => error);
+	await settle();
+	const creation = create(h.workspace).catch((error: unknown) => error);
+	await settle();
+	gate.reject(new Error("Native focus transition failed"));
+	expect(await focus).toBeInstanceOf(Error);
+	expect(await creation).toBeInstanceOf(Error);
+});

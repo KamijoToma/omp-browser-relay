@@ -288,7 +288,18 @@ export class Workspace {
 			}
 			await transition;
 		}
-		await Promise.all(this.#focusOps.values());
+		if (this.#focusOps.size > 0) {
+			const pending: Promise<void>[] = [];
+			for (const [tabId, operation] of this.#focusOps) {
+				if (!this.#known.has(tabId)) continue;
+				pending.push(
+					operation.catch(error => {
+						if (this.#known.has(tabId)) throw error;
+					}),
+				);
+			}
+			if (pending.length > 0) await Promise.all(pending);
+		}
 		if (this.#paused) throw new Error("Agent control is paused while you focus the dedicated agent window");
 	}
 
