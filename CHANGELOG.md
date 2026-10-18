@@ -15,6 +15,10 @@
 - Added compatibility with unmodified omp 18.12.2 and existing-work-page workflows in 18.4.2.
 - Added a settings-page control to create background work pages for older clients without switching windows.
 
+### Changed
+
+- Distinguished the extension from upstream with Background Fork naming, KamijoToma attribution, and its independent repository link in Chrome metadata and extension pages.
+
 ### Fixed
 
 - Preserved existing client sessions across paused workspace updates and allowed first-use workspace provisioning to complete.

@@ -1,17 +1,18 @@
 {
 	"manifest_version": 3,
-	"name": "OMP Browser Relay",
+	"name": "OMP Browser Relay (Background Fork)",
+	"short_name": "OMP Relay BG",
 	"version": "0.1.0",
 	"minimum_chrome_version": "125",
-	"description": "Controls a dedicated background agent window through a local CDP relay; pauses while you use it.",
-	"author": "Stencil Labs, Inc.",
-	"homepage_url": "https://omp.sh",
+	"description": "Independent fork by KamijoToma: dedicated background agent windows with user-priority pause. Not the bundled OMP extension.",
+	"author": "KamijoToma",
+	"homepage_url": "https://github.com/KamijoToma/omp-browser-relay",
 	"permissions": ["debugger", "tabs", "storage", "alarms"],
 	"background": {
 		"service_worker": "background.js"
 	},
 	"options_page": "options.html",
 	"action": {
-		"default_title": "OMP Browser Relay (click for settings)"
+		"default_title": "OMP Relay BG — Background Fork settings"
 	}
 }

@@ -2,6 +2,8 @@
 
 Standalone Bun CDP relay and Chrome MV3 extension for driving a **dedicated agent window** in your existing browser profile. Your normal browser windows are not discovered, attached, or adopted.
 
+The Chrome extension is named **OMP Browser Relay (Background Fork)**, with the short name **OMP Relay BG** and maintainer **KamijoToma**. Its homepage is [this independent repository](https://github.com/KamijoToma/omp-browser-relay), not the upstream omp site. The toolbar tooltip, settings page, and reserved workspace tab carry the fork identity; CLI names, permissions, and relay protocol are unchanged.
+
 ## Requirements
 
 - Bun 1.3.14 or newer.
@@ -44,7 +46,7 @@ In omp 18.12.2, ordinary `browser.open()` creates a new work page in the dedicat
 ## Window and input contract
 
 - Work-page creation by a current client or the options button creates a separate, unfocused agent window if absent. Existing targets are restricted to that workspace; ordinary user tabs are never adopted. Legacy opens only adopt pages, as described above.
-- A reserved **OMP agent workspace** tab supplies a safe native view. It is not an automation target. Work pages are created inactive and may be selected within the agent window without focusing the window.
+- A reserved **OMP Relay BG — Agent Workspace** tab supplies a safe native view. It is not an automation target. Work pages are created inactive and may be selected within the agent window without focusing the window.
 - Ordinary input uses the target page's real CDP keyboard/mouse events, not OS keyboard/mouse automation or synthetic DOM clicks. Work pages remain inactive during input; page-level focus emulation keeps background interaction responsive. A private, acknowledged 1-pixel screencast keeps captured pointer gestures drawing, then stops on release; its frames are never sent to clients or mixed into their recordings.
 - A screenshot temporarily selects its own work page with focus emulation disabled, captures the actual page, and restores the background interaction view. It never raises the window or falls back to a screenshot of the user's visible page.
 - Selecting the agent window pauses automation. Leaving it permits control again. In-flight/queued work cannot change the user's native selection after takeover.
