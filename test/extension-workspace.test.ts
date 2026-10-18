@@ -1266,3 +1266,22 @@ test("late screencast cleanup from a disconnected relay cannot suppress a new re
 		),
 	).toBeTrue();
 });
+
+test("replaces a closing workspace before Chrome emits its final window removal event", async () => {
+	const h = harness();
+	const old = await create(h.workspace);
+	const closing = [...h.tabs.values()].filter(tab => tab.windowId === old.windowId);
+	for (const tab of closing) {
+		h.tabs.delete(tab.id!);
+		h.events.removed.emit(tab.id!, { windowId: old.windowId, isWindowClosing: true });
+	}
+	const replacement = await create(h.workspace);
+	expect(replacement.windowId).not.toBe(old.windowId);
+	expect(replacement.windowId).not.toBe(10);
+	h.windows.delete(old.windowId);
+	h.events.windowRemoved.emit(old.windowId);
+	const hello = await h.workspace.hello("install-a", "Chrome/150.0");
+	expect(hello).toMatchObject({ workspaceWindowId: replacement.windowId, tabs: [replacement] });
+	expect(h.windows.get(10)?.focused).toBeTrue();
+	expect(h.windows.get(replacement.windowId)?.focused).toBeFalse();
+});

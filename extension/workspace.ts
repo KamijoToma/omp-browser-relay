@@ -107,7 +107,10 @@ export class Workspace {
 					.catch(() => {});
 			}
 		});
-		api.tabs.onRemoved.addListener(tabId => {
+		api.tabs.onRemoved.addListener((tabId, info) => {
+			// Tab removal precedes windows.onRemoved; never create into a window
+			// Chrome has begun closing while its window metadata still exists.
+			if (info.isWindowClosing && info.windowId === this.#windowId) void this.#forgetWindow();
 			void this.#retract(tabId);
 		});
 		api.debugger.onDetach.addListener((source, reason) => {

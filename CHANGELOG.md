@@ -25,6 +25,7 @@
 - Pausing during Puppeteer initialization no longer leaves the connection waiting indefinitely.
 - Discarded pages no longer block auto-attach, and stale target ids cannot address reused tabs after a browser restart.
 - Delayed recording cleanup from a disconnected client no longer interrupts a new recording.
+- A work page opened immediately after closing its workspace now gets a fresh background window instead of using the closing one.
 
 ## [18.3.1] - 2026-09-25
 
