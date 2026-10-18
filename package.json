@@ -1,0 +1,44 @@
+{
+	"name": "omp-browser-relay",
+	"version": "0.1.0",
+	"description": "Chrome CDP relay with a dedicated agent window and no implicit window activation",
+	"license": "MIT",
+	"bin": {
+		"omp-browser-relay": "dist/cli.js"
+	},
+	"files": [
+		"dist",
+		"src",
+		"LICENSE",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"type": "module",
+	"exports": {
+		".": "./src/server.ts",
+		"./protocol": "./src/protocol.ts"
+	},
+	"scripts": {
+		"build": "bun scripts/build.ts",
+		"start": "bun dist/cli.js",
+		"test": "bun test test",
+		"check": "bun run check:types && oxlint src extension scripts test && bun run check:format",
+		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"check:format": "oxfmt --check src extension scripts test package.json tsconfig.json .oxfmtrc.json",
+		"fmt": "oxfmt src extension scripts test package.json tsconfig.json .oxfmtrc.json",
+		"smoke": "bun scripts/smoke.ts",
+		"smoke:upstream": "RELAY_SMOKE_CLIENT=scripts/upstream-client.ts bun scripts/smoke.ts",
+		"smoke:upstream:prepare": "bun scripts/upstream-client.ts --prepare",
+		"prepack": "bun run build"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.3.14",
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
+		"oxfmt": "^0.65.0",
+		"oxlint": "^1.80.0",
+		"puppeteer-core": "25.3.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}

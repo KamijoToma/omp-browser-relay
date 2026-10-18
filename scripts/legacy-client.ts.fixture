@@ -1,0 +1,207 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import { createContext, runInContext } from "node:vm";
+import { PNG } from "pngjs";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/sdk";
+
+// This driver exercises npm 18.4.2's own eval JavaScript and SDK host. CDP
+// discovery below only observes native target identities; all browser actions
+// go through that release's public browser facade, never a replacement client.
+const [relayUrl, origin] = process.argv.slice(2);
+assert.ok(relayUrl && origin, "driver needs smoke relay and origin URLs");
+const session: ToolSession = {
+	cwd: process.cwd(),
+	hasUI: false,
+	getSessionFile: () => null,
+	getSessionSpawns: () => null,
+	getSessionId: () => "legacy-original-relay-contract",
+	settings: Settings.isolated({ "browser.relay": true, "browser.relayUrl": relayUrl, "browser.idleCloseSec": 0 }),
+};
+const prelude = createBrowserPrelude(session);
+assert.equal(prelude.enabled?.(), true);
+type ImagePart = { type: "image"; data: string; mimeType: string };
+const outputs: Array<{ content: Array<{ type: "text"; text: string } | ImagePart> }> = [];
+const realm = createContext({
+	__omp_display__: () => {},
+	__omp_log__: () => {},
+	__omp_prelude__: async (name: string, parameters: unknown) => {
+		assert.equal(name, "browser");
+		// The real eval transport clones parameters. Foreign VM prototypes must
+		// not leak into upstream's host-side plain-object/function decoding.
+		const result = await prelude.invoke(structuredClone(parameters), {
+			session,
+			toolCallId: `legacy-contract-${outputs.length}`,
+			signal: AbortSignal.timeout(30_000),
+		});
+		outputs.push(result);
+		return {
+			text: result.content.filter(part => part.type === "text").map(part => part.text).join("\n"),
+			details: structuredClone(result.details),
+		};
+	},
+});
+runInContext(prelude.javascript, realm, { filename: "original-omp-18.4.2-browser-prelude.js" });
+// Define every callback inside the eval realm, just as a real JavaScript eval
+// script would; never pass a host closure as purported page source.
+async function js<Result = unknown>(source: string): Promise<Result> {
+	return structuredClone(await runInContext(`(async () => { ${source}\n})()`, realm, { filename: "legacy-browser-contract.js" })) as Result;
+}
+async function rejects(source: string, expected: RegExp): Promise<void> {
+	let failure: unknown;
+	try { await js(source); } catch (error) { failure = error; }
+	assert.ok(failure && typeof failure === "object" && "message" in failure, "original public operation must reject");
+	assert.match(String(failure.message), expected);
+}
+interface DiffResult {
+	changed: boolean;
+	pixelChangeRatio: number;
+	diffPath: string;
+}
+interface RevisionResult {
+	changed: boolean;
+	revision: number;
+	path?: string;
+}
+type Target = { id: string; type: string; url: string; discarded: string };
+async function targets(): Promise<Target[]> {
+	const response = await fetch(`${relayUrl}/json/list`, { proxy: false });
+	assert.equal(response.status, 200);
+	const list = await response.json() as Target[];
+	assert.ok(Array.isArray(list));
+	return list.filter(target => target.type === "page" && target.discarded !== "true");
+}
+const files = new Set<string>();
+async function png(file: unknown): Promise<PNG> {
+	assert.ok(typeof file === "string");
+	files.add(file);
+	return PNG.sync.read(await fs.readFile(file));
+}
+function pixel(image: PNG, x: number, y: number): number[] {
+	return [...image.data.subarray((y * image.width + x) * 4, (y * image.width + x) * 4 + 4)];
+}
+try {
+	const ready = await fetch(`${origin}/__relay_smoke_client_ready`, { method: "POST", proxy: false });
+	assert.equal(await ready.text(), "ready");
+	assert.equal(await js("return typeof browser.targets;"), "undefined", "18.4.2 has no public browser.targets API");
+	const initial = await targets();
+	assert.equal(initial.some(target => target.url === `${origin}/user`), false, "relay discovery must not expose the user's window");
+	if (process.env.RELAY_LEGACY_EXPECT_EMPTY === "1") {
+		assert.equal(initial.length, 0, "empty-workspace mode requires smoke to remove every work tab before handoff");
+		await rejects("await browser.open();", /No page targets available on the attached browser/);
+		assert.equal((await targets()).length, 0);
+		console.log("PASS original npm 18.4.2 cold-start limitation: browser.open() rejects with no existing work page; it cannot bootstrap the dedicated workspace");
+	} else {
+		const seed = initial.find(target => target.url === `${origin}/agent`);
+		const other = initial.find(target => target.url === `${origin}/second`);
+		assert.ok(seed && other, "18.4.2 requires existing /agent and /second work tabs from smoke; it cannot create relay tabs");
+		// No options: old default open adopts an existing page, not about:blank.
+		const defaultTab = await js<{ name: string; url: string }>("globalThis.main = await browser.open(); return { name: main.name, url: await main.url() };");
+		assert.equal(defaultTab.name, "main");
+		assert.ok(initial.some(target => target.url === defaultTab.url));
+		assert.deepEqual((await targets()).map(target => target.id).sort(), initial.map(target => target.id).sort());
+		await js("await main.close();");
+		assert.deepEqual((await targets()).map(target => target.id).sort(), initial.map(target => target.id).sort(), "default-adopted close must not close any native page");
+		// app.target is a URL/title substring matcher, NOT an opaque target ID.
+		await js(`globalThis.main = await browser.open({ app: { target: ${JSON.stringify(`${origin}/agent`)} } });`);
+		assert.equal(await js("return await main.url();"), `${origin}/agent`);
+		const reused = await js(`return (await browser.open({ url: ${JSON.stringify(`${origin}/agent`)} })).name;`);
+		assert.equal(reused, "main", "open reuses and navigates an existing public tab name");
+		await js(`globalThis.second = await browser.open({ name: "legacy-second", app: { target: ${JSON.stringify(`${origin}/second`)} } });`);
+		const named = await js<Array<{ name: string; url: string }>>("return await browser.tabs();");
+		assert.deepEqual(named.map((tab: { name: string }) => tab.name).sort(), ["legacy-second", "main"]);
+		assert.equal(named.find((tab: { name: string }) => tab.name === "main")?.url, `${origin}/agent`);
+		assert.equal(named.find((tab: { name: string }) => tab.name === "legacy-second")?.url, `${origin}/second`);
+		await js('await second.fill("#field", "LEGACY_SECOND_ONLY"); await second.click("button");');
+		assert.equal(await js('return await second.text("output");'), "LEGACY_SECOND_ONLY");
+		assert.equal(await js('return await main.value("#field");'), "");
+		await js('await main.fill("#field", "LEGACY_AGENT_ONLY"); await main.click("button");');
+		assert.equal(await js('return await main.value("#field");'), "LEGACY_AGENT_ONLY");
+		assert.equal(await js('return await main.text("output");'), "LEGACY_AGENT_ONLY");
+		assert.equal(await js('return await second.value("#field");'), "LEGACY_SECOND_ONLY");
+		await js('await main.emulate({ viewport: { width: 800, height: 600, scale: 1 } });');
+		const geometry = await js(`return await main.evaluate(() => {
+			const canvas = document.querySelector("canvas");
+			canvas.style.cssText = "position:absolute;left:16px;top:160px;display:block;width:300px;height:160px;box-sizing:content-box;border:1px solid #999;margin:0;padding:0;touch-action:none";
+			canvas.getContext("2d").clearRect(0, 0, 300, 160);
+			const box = canvas.getBoundingClientRect();
+			return { width: innerWidth, height: innerHeight, scale: devicePixelRatio, x: box.x, y: box.y, canvasWidth: box.width, canvasHeight: box.height };
+		});`);
+		assert.deepEqual(geometry, { width: 800, height: 600, scale: 1, x: 16, y: 160, canvasWidth: 302, canvasHeight: 162 });
+		const box = await js<{ width: number; height: number }>('return await main.box("canvas");');
+		assert.equal(box.width, 302); assert.equal(box.height, 162);
+		await js(`const box = await main.box("canvas");
+			await main.mouseMove(box.x + 21, box.y + 21); await main.mouseDown();
+			await main.mouseMove(box.x + 141, box.y + 81, { steps: 12 });
+			await main.mouseMove(box.x + 221, box.y + 121, { steps: 8 }); await main.mouseUp();`);
+		const drawn = await js<{ finished: string; pixel: number[] }>(`return await main.evaluate(() => {
+			const canvas = document.querySelector("canvas");
+			return { finished: canvas.dataset.finished, pixel: [...canvas.getContext("2d").getImageData(80, 50, 1, 1).data] };
+		});`);
+		assert.equal(drawn.finished, "yes"); assert.deepEqual(drawn.pixel, [221, 34, 34, 255]);
+		await rejects('await main.evaluate(() => { throw new Error("LEGACY_REAL_PAGE_EXCEPTION"); });', /LEGACY_REAL_PAGE_EXCEPTION/);
+		await rejects('await browser.open({ name: "legacy-missing", app: { target: "NO_SUCH_LEGACY_TARGET_SENTINEL" } });', /No page target matched/);
+		await js(`await main.evaluate(() => {
+			document.activeElement?.blur();
+			const context = document.querySelector("canvas").getContext("2d");
+			context.fillStyle = "#dd2222"; context.fillRect(0, 0, 300, 160);
+		});`);
+		const screenshot = await js('return await main.screenshot({ selector: "canvas", format: "png" });');
+		const displayed = outputs.at(-1)!.content.filter((part): part is ImagePart => part.type === "image");
+		assert.equal(displayed.length, 1, "real screenshot must emit its consumer image");
+		const image = await png(screenshot);
+		assert.equal(image.width, 302); assert.equal(image.height, 162);
+		assert.deepEqual(pixel(image, 150, 80), [221, 34, 34, 255]);
+		// Consumer output may be compressed to another image format; decode it
+		// with the real browser rather than assuming its bytes are a PNG.
+		realm.consumerImage = structuredClone(displayed[0]);
+		const consumed = await js<{ width: number; height: number; pixel: number[] }>(`return await main.evaluate(async (data, mime) => {
+			const bitmap = await createImageBitmap(await (await fetch("data:" + mime + ";base64," + data)).blob());
+			const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
+			const context = canvas.getContext("2d"); context.drawImage(bitmap, 0, 0);
+			return { width: bitmap.width, height: bitmap.height, pixel: [...context.getImageData(Math.floor(bitmap.width / 2), Math.floor(bitmap.height / 2), 1, 1).data] };
+		}, consumerImage.data, consumerImage.mimeType);`);
+		assert.ok(Math.abs(consumed.width / consumed.height - image.width / image.height) <= 1 / consumed.height, "consumer image must preserve screenshot aspect ratio");
+		for (const [index, expected] of [221, 34, 34, 255].entries()) assert.ok(Math.abs(consumed.pixel[index] - expected) <= 2);
+		const baselinePath = await js('return await main.screenshot({ format: "png" });');
+		const baseline = await png(baselinePath);
+		assert.equal(baseline.width, 800); assert.equal(baseline.height, 600);
+		realm.baselinePath = baselinePath;
+		const unchanged = await js<DiffResult>("return await main.diffScreenshot(baselinePath);");
+		assert.equal(unchanged.changed, false); assert.equal(unchanged.pixelChangeRatio, 0);
+		await png(unchanged.diffPath);
+		await js(`await main.evaluate(() => {
+			const context = document.querySelector("canvas").getContext("2d");
+			context.fillStyle = "#2244dd"; context.fillRect(0, 0, 300, 160);
+		});`);
+		const changed = await js<DiffResult>("return await main.diffScreenshot(baselinePath);");
+		assert.equal(changed.changed, true);
+		assert.ok(Math.abs(changed.pixelChangeRatio - 300 * 160 / (800 * 600)) < 0.0001, "pixel diff must measure exactly the changed canvas area");
+		const diff = await png(changed.diffPath);
+		assert.equal(diff.width, 800); assert.equal(diff.height, 600);
+		const ignored = await js<DiffResult>("return await main.diffScreenshot(baselinePath, { threshold: 1 });");
+		assert.equal(ignored.changed, false); assert.equal(ignored.pixelChangeRatio, changed.pixelChangeRatio);
+		await png(ignored.diffPath);
+		const revision = await js<RevisionResult>('return await main.screenshot({ selector: "canvas", format: "png", ifChanged: true });');
+		assert.equal(revision.changed, true); assert.equal(revision.revision, 1); await png(revision.path);
+		const same = await js<RevisionResult>('return await main.screenshot({ selector: "canvas", format: "png", ifChanged: true });');
+		assert.equal(same.changed, false); assert.equal(same.revision, 1); assert.equal(same.path, undefined);
+		await js("await main.close(); await second.close();");
+		await assert.rejects(() => js('await main.value("#field");'), "a closed legacy handle must reject rather than reach another page");
+		assert.deepEqual((await targets()).map(target => target.id).sort(), initial.map(target => target.id).sort(), "all legacy relay pages are borrowed; close must retain native target identities");
+		await js(`globalThis.main = await browser.open({ app: { target: ${JSON.stringify(`${origin}/agent`)} } });`);
+		assert.equal(await js('return await main.value("#field");'), "LEGACY_AGENT_ONLY", "borrowed reopen must retain real form state");
+		await js(`globalThis.second = await browser.open({ name: "legacy-second", app: { target: ${JSON.stringify(`${origin}/second`)} } });`);
+		assert.equal(await js('return await second.value("#field");'), "LEGACY_SECOND_ONLY");
+		await js("await browser.close({ all: true });");
+		assert.deepEqual(await js("return await browser.tabs();"), []);
+		assert.deepEqual((await targets()).map(target => target.id).sort(), initial.map(target => target.id).sort());
+		console.log("PASS original npm 18.4.2 public frontend: default adoption, open reuse/navigation, URL-substring app.target, named borrowed pages, fill/click/canvas, decoded PNG/display, exact pixel diff/revisions, borrowed close/reopen/all-close, real errors");
+		console.log("LEGACY GAPS: browser.open() needs an existing work page; relay opens never create owned pages; browser.targets() is absent; app.target matches URL/title substrings, not opaque target IDs. Owned relay close semantics are unavailable in this release.");
+	}
+	console.log("ENTRY LIMIT: unmodified npm 18.4.2 browser eval JavaScript + createBrowserPrelude SDK host; original CLI --version only, no LLM CLI flow");
+} finally {
+	await js("await browser.close({ all: true });");
+	for (const file of files) await Bun.file(file).delete();
+}

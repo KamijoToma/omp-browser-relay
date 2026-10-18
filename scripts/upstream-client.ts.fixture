@@ -1,0 +1,301 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { createContext, runInContext } from "node:vm";
+import { PNG } from "pngjs";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+
+// Executed only from the isolated fixture, with real installed package exports.
+// The unmodified JavaScript eval facade calls its real SDK host; no model, fake
+// transport, patched modules, or copied omp implementation participates.
+interface Tab {
+	name: string;
+	url(): Promise<string>;
+	fill(selector: string, text: string): Promise<void>;
+	click(selector: string): Promise<void>;
+	value(selector: string): Promise<string>;
+	text(selector: string): Promise<string>;
+	box(selector: string): Promise<{ x: number; y: number; width: number; height: number }>;
+	mouseMove(x: number, y: number, options?: { steps: number }): Promise<void>;
+	mouseDown(): Promise<void>;
+	mouseUp(): Promise<void>;
+	evaluate<Args extends unknown[], Result>(fn: (...args: Args) => Result, ...args: Args): Promise<Awaited<Result>>;
+	screenshot(options?: { selector?: string; format?: "png"; ifChanged?: boolean }): Promise<unknown>;
+	emulate(options: { viewport: { width: number; height: number; scale: number } }): Promise<unknown>;
+	recordStart(destination: string, options: { fps: number; quality: number }): Promise<unknown>;
+	recordStop(): Promise<unknown>;
+	recording(): Promise<unknown>;
+	diffScreenshot(baseline: string, options?: { threshold?: number }): Promise<unknown>;
+	close(): Promise<void>;
+}
+interface BrowserFacade {
+	open(options?: { name?: string; url?: string; app?: { target?: string }; viewport?: { width: number; height: number } }): Promise<Tab>;
+	tabs(): Promise<Array<{ name: string; url: string }>>;
+	targets(): Promise<Array<{ target: string; url: string; title: string; shown: boolean }>>;
+	close(options: { all: boolean }): Promise<void>;
+}
+const [relayUrl, origin] = process.argv.slice(2);
+assert.ok(relayUrl && origin, "driver needs smoke relay and origin URLs");
+const session: ToolSession = {
+	cwd: process.cwd(),
+	hasUI: false,
+	getSessionFile: () => null,
+	getSessionSpawns: () => null,
+	getSessionId: () => "original-relay-contract",
+	settings: Settings.isolated({ "browser.relay": true, "browser.relayUrl": relayUrl, "browser.idleCloseSec": 0 }),
+};
+const prelude = createBrowserPrelude(session);
+assert.equal(prelude.enabled?.(), true);
+const outputs: Array<{ content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> }> = [];
+const realm = createContext({
+	__omp_log__: () => {},
+	__omp_prelude__: async (name: string, parameters: unknown) => {
+		assert.equal(name, "browser");
+		// The real eval transport crosses a structured-data boundary. Passing VM
+		// objects directly would make upstream reject their foreign prototypes.
+		const result = await prelude.invoke(structuredClone(parameters), { session, toolCallId: `contract-${outputs.length}`, signal: AbortSignal.timeout(30_000) });
+		outputs.push(result);
+		return {
+			text: result.content.filter(part => part.type === "text").map(part => part.text).join("\n"),
+			details: result.details,
+		};
+	},
+});
+runInContext(prelude.javascript, realm, { filename: "original-omp-browser-prelude.js" });
+const browser: BrowserFacade = runInContext("browser", realm);
+const files = new Set<string>();
+function record(value: unknown): Record<string, unknown> {
+	assert.ok(value !== null && typeof value === "object" && !Array.isArray(value));
+	return value as Record<string, unknown>;
+}
+async function errorMatches(operation: () => Promise<unknown>, pattern: RegExp): Promise<void> {
+	let failure: unknown;
+	try { await operation(); } catch (error) { failure = error; }
+	const error = record(failure);
+	assert.ok(typeof error.message === "string", "operation must reject with a real upstream error");
+	assert.match(error.message, pattern);
+}
+async function readPng(file: unknown): Promise<PNG> {
+	assert.ok(typeof file === "string");
+	files.add(file);
+	return PNG.sync.read(await fs.readFile(file));
+}
+function pixel(image: PNG, x: number, y: number): number[] {
+	return [...image.data.subarray((y * image.width + x) * 4, (y * image.width + x) * 4 + 4)];
+}
+async function deterministicViewport(tab: Tab): Promise<void> {
+	// Public emulation calls the release's viewport.scale -> deviceScaleFactor
+	// contract; open({ viewport }) otherwise defaults to upstream's DPR 1.25.
+	await tab.emulate({ viewport: { width: 800, height: 600, scale: 1 } });
+	const geometry = record(await tab.evaluate(() => {
+		const canvas = document.querySelector("canvas")!;
+		canvas.style.cssText = "position:absolute;left:16px;top:160px;display:block;width:300px;height:160px;box-sizing:content-box;border:1px solid #999;margin:0;padding:0;touch-action:none";
+		const box = canvas.getBoundingClientRect();
+		return { width: innerWidth, height: innerHeight, scale: devicePixelRatio, x: box.x, y: box.y, canvasWidth: box.width, canvasHeight: box.height };
+	}));
+	assert.deepEqual(geometry, { width: 800, height: 600, scale: 1, x: 16, y: 160, canvasWidth: 302, canvasHeight: 162 });
+}
+async function mediaCommand(binary: "ffmpeg" | "ffprobe", args: string[]): Promise<Uint8Array> {
+	const executable = Bun.which(binary);
+	assert.ok(executable, `Original recording acceptance requires system ${binary} on PATH`);
+	const child = Bun.spawn([executable, ...args], { stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(child.stdout).bytes(), new Response(child.stderr).text(), child.exited,
+	]);
+	assert.equal(code, 0, `${binary} failed while inspecting original recording: ${stderr}`);
+	return stdout;
+}
+async function animateRecording(tab: Tab, label: string): Promise<string> {
+	assert.equal(record(await tab.recording()).active, false);
+	const destination = path.join(process.cwd(), `original-recording-${label}-${process.pid}.webm`);
+	files.add(destination);
+	// The original MP4 encoder requires libx264. WebM is a real public API
+	// alternative using upstream's VP9/VP8 encoder, not a patched codec path.
+	const started = record(await tab.recordStart(destination, { fps: 60, quality: 100 }));
+	assert.equal(started.path, destination); assert.equal(started.fps, 60);
+	const active = record(await tab.recording());
+	assert.equal(active.active, true); assert.equal(active.path, destination); assert.equal(active.fps, 60);
+	await errorMatches(() => tab.recordStart(destination, { fps: 60, quality: 100 }), /already active/i);
+	// Each public evaluation causes a real compositor change. Host-side delays
+	// avoid background-tab requestAnimationFrame/timer throttling assumptions.
+	for (const color of ["#dd2222", "#2244dd", "#dd2222", "#2244dd", "#dd2222", "#2244dd"]) {
+		await tab.evaluate((color: string) => {
+			const context = document.querySelector("canvas")!.getContext("2d")!;
+			context.fillStyle = color; context.fillRect(0, 0, 300, 160);
+		}, color);
+		await Bun.sleep(200);
+	}
+	const captured = record(await tab.recording());
+	assert.ok(Number(captured.frames) >= 2, "original recording must capture multiple real screencast frames before finalization");
+	return destination;
+}
+async function inspectRecording(destination: string, stopped?: Record<string, unknown>): Promise<void> {
+	const bytes = await fs.readFile(destination);
+	assert.deepEqual([...bytes.subarray(0, 4)], [0x1a, 0x45, 0xdf, 0xa3], "recording must contain a real EBML/WebM header");
+	if (stopped) {
+		assert.equal(stopped.path, destination); assert.equal(stopped.bytes, bytes.length);
+		assert.ok(Number(stopped.durationMs) >= 1_200); assert.ok(Number(stopped.frames) >= 2);
+	}
+	const metadata = JSON.parse(new TextDecoder().decode(await mediaCommand("ffprobe", [
+		"-v", "error", "-select_streams", "v:0", "-count_frames",
+		"-show_entries", "stream=codec_name,width,height,avg_frame_rate,nb_read_frames:format=format_name,duration",
+		"-of", "json", destination,
+	]))) as { streams: Array<{ codec_name: string; width: number; height: number; avg_frame_rate: string; nb_read_frames: string }>; format: { format_name: string; duration: string } };
+	assert.equal(metadata.streams.length, 1);
+	const stream = metadata.streams[0]!;
+	assert.match(stream.codec_name, /^vp[89]$/); assert.match(metadata.format.format_name, /webm/);
+	assert.equal(stream.width, 800); assert.equal(stream.height, 600);
+	assert.equal(stream.avg_frame_rate, "60/1"); assert.ok(Number(stream.nb_read_frames) >= 2);
+	assert.ok(Number(metadata.format.duration) >= 1.2);
+	// Decode the encoded video, not the source screenshots. This 2x2 crop is
+	// inside the fixed canvas and respects chroma subsampling alignment.
+	const samples = await mediaCommand("ffmpeg", [
+		"-v", "error", "-i", destination, "-vf", "crop=2:2:166:240",
+		"-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+	]);
+	assert.equal(samples.length, Number(stream.nb_read_frames) * 12, "every encoded frame must decode");
+	const seen = new Set<string>();
+	for (let offset = 0; offset < samples.length; offset += 12) {
+		for (const [name, expected] of [["red", [221, 34, 34]], ["blue", [34, 68, 221]]] as const) {
+			if (expected.every((channel, index) => Math.abs(samples[offset + index]! - channel) <= 20)) seen.add(name);
+		}
+	}
+	assert.deepEqual([...seen].sort(), ["blue", "red"], "decoded video must contain both actual canvas color states");
+	console.log(`PASS original recording ${path.basename(destination)}: ${JSON.stringify({ codec: stream.codec_name, width: stream.width, height: stream.height, frames: Number(stream.nb_read_frames), duration: Number(metadata.format.duration), bytes: bytes.length, colors: [...seen].sort() })}`);
+}
+try {
+	const ready = await fetch(`${origin}/__relay_smoke_client_ready`, { method: "POST", proxy: false });
+	assert.equal(await ready.text(), "ready", "native smoke must acknowledge the original client's operation phase");
+	// Deliberately no name, app, or target: settings select relay and upstream
+	// browser.open() itself must create a page, not silently adopt a user tab.
+	const main = await browser.open();
+	assert.equal(main.name, "main");
+	assert.equal(await main.url(), "about:blank");
+	// open on an existing name is the public navigation/reuse contract.
+	const reused = await browser.open({ url: `${origin}/upstream-main`, viewport: { width: 800, height: 600 } });
+	assert.equal(reused.name, "main");
+	assert.equal(await main.url(), `${origin}/upstream-main`);
+	await deterministicViewport(main);
+	const second = await browser.open({ name: "contract-second", url: `${origin}/upstream-second` });
+	const tabs = await browser.tabs();
+	assert.deepEqual(tabs.map(tab => tab.name).sort(), ["contract-second", "main"]);
+	assert.equal(tabs.find(tab => tab.name === "main")?.url, `${origin}/upstream-main`);
+	assert.equal(tabs.find(tab => tab.name === "contract-second")?.url, `${origin}/upstream-second`);
+	const targets = await browser.targets();
+	assert.equal(targets.some(target => target.url === `${origin}/user`), false, "relay must not disclose user A");
+	const selected = targets.filter(target => target.url === `${origin}/upstream-second`);
+	assert.equal(selected.length, 1);
+	assert.equal(selected[0]!.target, `${origin}/upstream-second`);
+	assert.equal(typeof selected[0]!.shown, "boolean");
+	assert.equal(selected[0]!.title, "Agent page");
+	await second.close();
+	const remainingTargets = await browser.targets();
+	assert.equal(remainingTargets.some(target => target.target === selected[0]!.target), false, "closing an omp-created page closes its native target");
+	// The existing smoke creates this workspace page outside omp. Explicit
+	// target adoption must borrow it, not create or adopt the user's page.
+	const borrowed = targets.filter(target => target.url === `${origin}/agent`);
+	assert.equal(borrowed.length, 1);
+	const adopted = await browser.open({ name: "contract-adopted", app: { target: borrowed[0]!.target } });
+	assert.equal(await adopted.url(), `${origin}/agent`);
+	await adopted.fill("#field", "SECOND_TAB_ONLY");
+	await adopted.click("button");
+	assert.equal(await adopted.text("output"), "SECOND_TAB_ONLY");
+	assert.equal(await main.value("#field"), "", "names must isolate page state");
+	await main.fill("#field", "UPSTREAM_AGENT_ONLY");
+	await main.click("button");
+	assert.equal(await main.value("#field"), "UPSTREAM_AGENT_ONLY");
+	assert.equal(await main.text("output"), "UPSTREAM_AGENT_ONLY");
+	const box = await main.box("canvas");
+	assert.equal(box.width, 302);
+	assert.equal(box.height, 162);
+	await main.mouseMove(box.x + 21, box.y + 21);
+	await main.mouseDown();
+	await main.mouseMove(box.x + 141, box.y + 81, { steps: 12 });
+	await main.mouseMove(box.x + 221, box.y + 121, { steps: 8 });
+	await main.mouseUp();
+	const canvas = record(await main.evaluate(() => {
+		const canvas = document.querySelector("canvas")!;
+		return { finished: canvas.dataset.finished, pixel: [...canvas.getContext("2d")!.getImageData(80, 50, 1, 1).data] };
+	}));
+	assert.equal(canvas.finished, "yes");
+	assert.deepEqual(canvas.pixel, [221, 34, 34, 255]);
+	await errorMatches(() => main.fill("#absent-real-selector", "must fail"), /selector|element|found|timeout|timed out/i);
+	await errorMatches(() => main.evaluate(() => { throw new Error("REAL_PAGE_EXCEPTION_SENTINEL"); }), /REAL_PAGE_EXCEPTION_SENTINEL/);
+	await errorMatches(() => browser.open({ name: "missing-target", app: { target: "NO_SUCH_RELAY_TARGET_SENTINEL" } }), /target|match|found/i);
+	// Large known-color patch gives semantic image evidence, not byte lengths.
+	await main.evaluate(() => {
+		(document.activeElement as HTMLElement | null)?.blur();
+		const canvas = document.querySelector("canvas")!;
+		const context = canvas.getContext("2d")!;
+		context.fillStyle = "#dd2222"; context.fillRect(0, 0, 300, 160);
+	});
+	const screenshot = await main.screenshot({ selector: "canvas", format: "png" });
+	const displayed = outputs.at(-1)!.content.filter(part => part.type === "image");
+	assert.equal(displayed.length, 1, "screenshot must emit one consumer image");
+	const image = await readPng(screenshot);
+	assert.equal(image.width, 302); assert.equal(image.height, 162);
+	assert.deepEqual(pixel(image, 150, 80), [221, 34, 34, 255]);
+	const consumed = record(await main.evaluate(async (data: string, mime: string) => {
+		const bitmap = await createImageBitmap(await (await fetch(`data:${mime};base64,${data}`)).blob());
+		const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
+		const context = canvas.getContext("2d")!; context.drawImage(bitmap, 0, 0);
+		return { width: bitmap.width, height: bitmap.height, pixel: [...context.getImageData(Math.floor(bitmap.width / 2), Math.floor(bitmap.height / 2), 1, 1).data] };
+	}, displayed[0]!.data, displayed[0]!.mimeType));
+	assert.ok(typeof consumed.width === "number" && typeof consumed.height === "number");
+	assert.ok(Math.abs(consumed.width / consumed.height - image.width / image.height) <= 1 / consumed.height, "consumer image must preserve the captured region's aspect ratio");
+	const consumedPixel = consumed.pixel as number[];
+	assert.equal(consumedPixel.length, 4);
+	for (const [index, expected] of [221, 34, 34, 255].entries()) assert.ok(Math.abs(consumedPixel[index]! - expected) <= 2, "display image must contain the actual red canvas");
+	const baselinePath = await main.screenshot({ format: "png" });
+	const baseline = await readPng(baselinePath);
+	assert.equal(baseline.width, 800); assert.equal(baseline.height, 600);
+	const unchanged = record(await main.diffScreenshot(baselinePath as string));
+	assert.equal(unchanged.changed, false); assert.equal(unchanged.pixelChangeRatio, 0);
+	await readPng(unchanged.diffPath);
+	await main.evaluate(() => {
+		const context = document.querySelector("canvas")!.getContext("2d")!;
+		context.fillStyle = "#2244dd"; context.fillRect(0, 0, 300, 160);
+	});
+	const changed = record(await main.diffScreenshot(baselinePath as string));
+	assert.equal(changed.changed, true);
+	const expectedRatio = 300 * 160 / (baseline.width * baseline.height);
+	assert.ok(Math.abs(Number(changed.pixelChangeRatio) - expectedRatio) < 0.0001, "diff must measure exactly the changed canvas area");
+	const diff = await readPng(changed.diffPath);
+	assert.equal(diff.width, baseline.width); assert.equal(diff.height, baseline.height);
+	const ignored = record(await main.diffScreenshot(baselinePath as string, { threshold: 1 }));
+	assert.equal(ignored.changed, false); assert.equal(ignored.pixelChangeRatio, changed.pixelChangeRatio);
+	await readPng(ignored.diffPath);
+	const firstRevision = record(await main.screenshot({ selector: "canvas", format: "png", ifChanged: true }));
+	assert.equal(firstRevision.changed, true); assert.equal(firstRevision.revision, 1); assert.equal(firstRevision.pixelChangeRatio, 1);
+	await readPng(firstRevision.path);
+	const sameRevision = record(await main.screenshot({ selector: "canvas", format: "png", ifChanged: true }));
+	assert.equal(sameRevision.changed, false); assert.equal(sameRevision.revision, 1); assert.equal(sameRevision.pixelChangeRatio, 0); assert.equal(sameRevision.path, undefined);
+	await errorMatches(() => main.recordStop(), /requires an active recording/i);
+	const explicitRecording = await animateRecording(main, "explicit-stop");
+	await inspectRecording(explicitRecording, record(await main.recordStop()));
+	assert.equal(record(await main.recording()).active, false);
+	await errorMatches(() => main.recordStop(), /requires an active recording/i);
+	const ownedCloseRecording = await animateRecording(main, "owned-close");
+	await main.close();
+	await inspectRecording(ownedCloseRecording);
+	await assert.rejects(() => main.value("#field"), "a closed public handle must reject instead of reaching another page");
+	const reopened = await browser.open({ url: `${origin}/upstream-reopened` });
+	assert.equal(reopened.name, "main"); assert.equal(await reopened.url(), `${origin}/upstream-reopened`);
+	assert.equal(await reopened.value("#field"), "");
+	assert.equal(await adopted.value("#field"), "SECOND_TAB_ONLY");
+	await deterministicViewport(adopted);
+	const borrowedCloseRecording = await animateRecording(adopted, "borrowed-close");
+	await adopted.close();
+	await inspectRecording(borrowedCloseRecording);
+	assert.equal((await browser.targets()).some(target => target.target === borrowed[0]!.target), true, "closing a borrowed page must not close its native target");
+	const borrowedAgain = await browser.open({ name: "contract-adopted", app: { target: borrowed[0]!.target } });
+	assert.equal(await borrowedAgain.value("#field"), "SECOND_TAB_ONLY", "reopening a borrowed target must preserve its real form state");
+	assert.equal(record(await borrowedAgain.recording()).active, false, "reopening a borrowed target must not retain the closed worker's recording");
+	console.log("PASS original SDK frontend: default open, URL target adoption, named tabs, fill/click/canvas, DPR-1 decoded screenshot/display, exact pixel diff, change revisions, decoded WebM recording stop + owned/borrowed close finalization, real errors");
+	console.log("ENTRY LIMIT: original browser eval JavaScript facade + createBrowserPrelude SDK host; original CLI --version only, no LLM CLI flow");
+} finally {
+	await browser.close({ all: true });
+	for (const file of files) await Bun.file(file).delete();
+}
