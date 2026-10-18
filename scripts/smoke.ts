@@ -470,12 +470,12 @@ try {
 		await chrome.windows.update(id, { focused: true });
 	}, userWindow);
 	await extension.waitForFunction(
-		id => {
-			const events: unknown = Reflect.get(globalThis, "__relaySmokeFocusEvents");
-			return Array.isArray(events) && events.at(-1) === id;
+		async ({ userWindow, agentWindow }) => {
+			const [user, agent] = await Promise.all([chrome.windows.get(userWindow), chrome.windows.get(agentWindow)]);
+			return user.focused && !agent.focused;
 		},
 		{ polling: 20, timeout: 5_000 },
-		userWindow,
+		{ userWindow, agentWindow },
 	);
 	await extension.evaluate("globalThis.__relaySmokeFocusEvents.length = 0");
 	await agent.evaluate(() => {
