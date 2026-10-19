@@ -53,9 +53,14 @@
 			relay was started with.
 		</p>
 		<p class="hint">
-			Agent pages open in a separate background window, never in your normal browser window. Selecting an agent tab
-			does not focus its window. Control pauses while you focus the agent window and resumes when you leave it.
-			Dragging an agent tab into another window immediately releases it.
+			Agent pages open in a separate workspace window. You can observe and operate them at any time; focusing this
+			window does not pause the agent. Drag a business tab into the workspace to grant control, or out to revoke it.
+			Simultaneous actions on one page can conflict.
+		</p>
+		<p class="hint">
+			Chrome's mouse input can activate the workspace and interrupt typing or scrolling in another window. This
+			shared-control policy permits that activation; it is not background focus isolation. The relay never selects,
+			attaches, or directly controls tabs outside the workspace.
 		</p>
 		<p class="hint">
 			This is window isolation, not a sandbox: websites and scripts can still request popups or system dialogs.
@@ -68,8 +73,8 @@
 		<button id="save">Save</button><span id="status"></span>
 		<h2>Agent workspace</h2>
 		<p class="hint">
-			Older omp versions need an existing work page before connecting. Create one here without switching away from
-			this window. Newer versions create their own work pages.
+			Older omp versions need an existing workspace page before connecting. Create a blank page here; newer versions
+			can create their own work pages.
 		</p>
 		<button id="create-work-tab">Create background work tab</button>
 		<p id="workspace-status" role="status"></p>

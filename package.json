@@ -1,7 +1,7 @@
 {
 	"name": "omp-browser-relay",
-	"version": "0.1.0",
-	"description": "Chrome CDP relay with a dedicated agent window and no implicit window activation",
+	"version": "0.2.0",
+	"description": "Window-scoped Chrome CDP relay with visible shared-control workspaces and stock omp browser APIs",
 	"license": "MIT",
 	"bin": {
 		"omp-browser-relay": "dist/cli.js"
@@ -9,6 +9,7 @@
 	"files": [
 		"dist",
 		"src",
+		"skills",
 		"LICENSE",
 		"README.md",
 		"CHANGELOG.md"

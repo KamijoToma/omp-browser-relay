@@ -140,6 +140,18 @@ try {
 			return { finished: canvas.dataset.finished, pixel: [...canvas.getContext("2d").getImageData(80, 50, 1, 1).data] };
 		});`);
 		assert.equal(drawn.finished, "yes"); assert.deepEqual(drawn.pixel, [221, 34, 34, 255]);
+		await js(`await main.evaluate(() => {
+			const canvas = document.querySelector("canvas");
+			canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+			delete canvas.dataset.finished;
+		});
+		const dragBox = await main.box("canvas");
+		await main.drag({ x: dragBox.x + 21, y: dragBox.y + 41 }, { x: dragBox.x + 221, y: dragBox.y + 41 });`);
+		const dragged = await js<{ finished: string; pixel: number[] }>(`return await main.evaluate(() => {
+			const canvas = document.querySelector("canvas");
+			return { finished: canvas.dataset.finished, pixel: [...canvas.getContext("2d").getImageData(80, 40, 1, 1).data] };
+		});`);
+		assert.equal(dragged.finished, "yes"); assert.deepEqual(dragged.pixel, [221, 34, 34, 255]);
 		await rejects('await main.evaluate(() => { throw new Error("LEGACY_REAL_PAGE_EXCEPTION"); });', /LEGACY_REAL_PAGE_EXCEPTION/);
 		await rejects('await browser.open({ name: "legacy-missing", app: { target: "NO_SUCH_LEGACY_TARGET_SENTINEL" } });', /No page target matched/);
 		await js(`await main.evaluate(() => {

@@ -14,6 +14,7 @@
  * user's logged-in browser.
  */
 import { RelayBridge } from "./bridge";
+import { RELAY_REFERENCE, relayCapabilities } from "./capabilities";
 import { RELAY_CAPABILITIES, type RelayUnavailableInfo } from "./protocol";
 
 export type { RelayUnavailableInfo } from "./protocol";
@@ -95,6 +96,10 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				return new Response("websocket upgrade required", { status: 426 });
 			}
 			if (req.method !== "GET") return new Response("Method not allowed", { status: 405 });
+			if (path === "/capabilities") return Response.json(relayCapabilities(bridge.ready, bridge.extensionSeen));
+			if (path === "/docs") {
+				return new Response(RELAY_REFERENCE, { headers: { "Content-Type": "text/markdown; charset=utf-8" } });
+			}
 			if (path === "/json/version") {
 				if (!bridge.ready) {
 					const info: RelayUnavailableInfo = {

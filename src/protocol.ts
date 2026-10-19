@@ -1,15 +1,21 @@
 /** Versioned transport between the standalone relay and its Chrome extension. */
-export const RELAY_PROTOCOL_VERSION = 2;
+export const RELAY_PROTOCOL_VERSION = 3;
 export const DISCARDED_TABS_PROTOCOL_VERSION = 1;
 
 export interface RelayCapabilities {
 	protocolVersion: typeof RELAY_PROTOCOL_VERSION;
 	windowIsolation: "dedicated-window";
+	sharedControl: true;
+	tabAdoption: "window-membership";
+	nativeFocus: "browser-dependent";
 }
 
 export const RELAY_CAPABILITIES: RelayCapabilities = {
 	protocolVersion: RELAY_PROTOCOL_VERSION,
 	windowIsolation: "dedicated-window",
+	sharedControl: true,
+	tabAdoption: "window-membership",
+	nativeFocus: "browser-dependent",
 };
 
 /** Only tabs inside the extension-owned workspace are exposed. */
@@ -43,11 +49,10 @@ export type ExtToRelayMessage =
 			userAgent: string;
 			browserVersion: string;
 			workspaceWindowId: number | null;
-			workspacePaused: boolean;
 			tabs: TabSnapshot[];
 			attachedTabIds: number[];
 	  }
-	| { t: "workspace"; windowId: number | null; paused: boolean }
+	| { t: "workspace"; windowId: number | null }
 	| { t: "cdpEvent"; tabId: number; sessionId?: string; method: string; params?: Record<string, unknown> }
 	| { t: "detached"; tabId: number; reason: string; relayInitiated?: boolean }
 	| { t: "tabCreated"; tab: TabSnapshot }

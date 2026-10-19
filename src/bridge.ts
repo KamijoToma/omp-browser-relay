@@ -89,8 +89,6 @@ class CdpConnection {
 	readonly sessions = new Map<string, SessionRef>();
 	/** Browser pseudo-sessions have no owning workspace tab. */
 	readonly browserSessions = new Set<string>();
-	/** Logical focus leases are connection-scoped, not Chrome-global. */
-	readonly focusTabs = new Set<string>();
 	affineInstanceId: string | null = null;
 
 	constructor(
@@ -119,7 +117,6 @@ interface ExtInstance {
 	socket: RelaySocket | null;
 	info: { userAgent: string; browserVersion: string } | null;
 	workspaceWindowId: number | null;
-	workspacePaused: boolean;
 }
 
 /** Deterministic per-instance code for target ids: stable across relay restarts. */
@@ -200,8 +197,6 @@ class TabState {
 	rootRuntimeEnabling: Promise<void> | null = null;
 	/** Invalidates an in-flight Runtime enable when the debugger detaches. */
 	runtimeGeneration = 0;
-	focusManaged = false;
-	focusUpdating: Promise<void> = Promise.resolve();
 
 	constructor(
 		readonly instanceId: string,
@@ -260,7 +255,7 @@ export class RelayBridge {
 			reject: (err: Error) => void;
 			timer: NodeJS.Timeout;
 			tabKey?: string;
-			cleanup: boolean;
+			lifecycleWindowId?: number;
 		}
 	>();
 	/** Downstream child session id → browser-scoped Chrome session and tab. */
@@ -338,7 +333,7 @@ export class RelayBridge {
 	listTargets(): Array<Record<string, string>> {
 		const out: Array<Record<string, string>> = [];
 		for (const tab of this.#tabs.values()) {
-			if (!this.#eligible(tab, true)) continue;
+			if (!this.#eligible(tab)) continue;
 			out.push({
 				id: pageTargetIdFromKey(tab.tabKey),
 				type: "page",
@@ -353,10 +348,11 @@ export class RelayBridge {
 
 	// ---- extension lifecycle -------------------------------------------------
 
-	#rejectPendingExtensionRpcs(instanceId: string, error: Error, keepCleanup = false): void {
+	#rejectPendingExtensionRpcs(instanceId: string, error: Error, closingWindowId?: number): void {
 		const prefix = `${instanceId}:`;
 		for (const [key, pending] of this.#pendingRpc) {
-			if (!key.startsWith(prefix) || (keepCleanup && pending.cleanup)) continue;
+			if (!key.startsWith(prefix)) continue;
+			if (closingWindowId !== undefined && pending.lifecycleWindowId === closingWindowId) continue;
 			clearTimeout(pending.timer);
 			pending.reject(error);
 			this.#pendingRpc.delete(key);
@@ -387,36 +383,22 @@ export class RelayBridge {
 		}
 	}
 
-	#setWorkspace(inst: ExtInstance, windowId: number | null, paused: boolean): void {
+	#setWorkspace(inst: ExtInstance, windowId: number | null): void {
 		const previousWindowId = inst.workspaceWindowId;
 		const changed = previousWindowId !== windowId;
-		const wasPaused = inst.workspacePaused;
 		inst.workspaceWindowId = windowId;
-		inst.workspacePaused = paused;
 		// Provisioning an absent workspace must complete its in-flight createTab RPC.
-		if ((changed && previousWindowId !== null) || (paused && !wasPaused)) {
+		if (changed && previousWindowId !== null) {
 			this.#rejectPendingExtensionRpcs(
 				inst.instanceId,
-				new ExtensionReplacedError("Agent workspace changed or paused"),
-				!changed,
+				new ExtensionReplacedError("Agent workspace changed"),
+				windowId === null ? previousWindowId : undefined,
 			);
 		}
 		for (const tab of this.#tabs.values()) {
 			if (tab.instanceId !== inst.instanceId) continue;
 			if (windowId === null || tab.windowId !== windowId) {
 				this.#onTabRemoved(tab.tabKey);
-			} else if (wasPaused && !paused && !tab.announced) {
-				this.#onTabUpsert(
-					{
-						tabId: tab.tabId,
-						url: tab.url,
-						title: tab.title,
-						active: tab.active,
-						discarded: tab.discarded,
-						windowId: tab.windowId,
-					},
-					inst.instanceId,
-				);
 			}
 		}
 	}
@@ -440,8 +422,8 @@ export class RelayBridge {
 		if (!inst || inst.socket !== socket) return;
 		switch (msg.t) {
 			case "workspace":
-				if (!isWindowId(msg.windowId) || typeof msg.paused !== "boolean") return;
-				this.#setWorkspace(inst, msg.windowId, msg.paused);
+				if (!isWindowId(msg.windowId)) return;
+				this.#setWorkspace(inst, msg.windowId);
 				return;
 			case "rpcResult": {
 				const key = `${instanceId}:${msg.id}`;
@@ -485,7 +467,6 @@ export class RelayBridge {
 			typeof msg.userAgent !== "string" ||
 			typeof msg.browserVersion !== "string" ||
 			!isWindowId(msg.workspaceWindowId) ||
-			typeof msg.workspacePaused !== "boolean" ||
 			!Array.isArray(msg.tabs) ||
 			!msg.tabs.every(isTabSnapshot) ||
 			!Array.isArray(msg.attachedTabIds) ||
@@ -507,7 +488,6 @@ export class RelayBridge {
 				socket: null,
 				info: null,
 				workspaceWindowId: null,
-				workspacePaused: false,
 			};
 			this.#instances.set(instanceId, inst);
 		} else if (inst.socket && inst.socket !== socket) {
@@ -533,7 +513,7 @@ export class RelayBridge {
 		inst.socket = socket;
 		this.#socketInstance.set(socket, instanceId);
 		inst.info = { userAgent: msg.userAgent, browserVersion: msg.browserVersion };
-		this.#setWorkspace(inst, msg.workspaceWindowId, msg.workspacePaused);
+		this.#setWorkspace(inst, msg.workspaceWindowId);
 		this.#lastHelloInstance = instanceId;
 		this.#extensionSeen = true;
 		this.#extensionGoneSince = null;
@@ -565,7 +545,6 @@ export class RelayBridge {
 					if (!ok && tab.banned) this.#onTabDetached(tab.tabKey, "reattach_failed", false);
 				});
 			}
-			if (tab.attached && tab.focusManaged) void this.#syncFocus(tab).catch(() => {});
 		}
 		for (const snap of msg.tabs) this.#onTabUpsert(snap, instanceId);
 		this.#log("extension connected", {
@@ -591,16 +570,10 @@ export class RelayBridge {
 		this.#conns.delete(connId);
 		const touched = new Set<string>();
 		for (const ref of conn.sessions.values()) touched.add(ref.tabKey);
-		for (const tabKey of conn.focusTabs) touched.add(tabKey);
-		conn.focusTabs.clear();
 		conn.sessions.clear();
 		conn.browserSessions.clear();
 		// Drop the debugger (and its infobar) from tabs nobody drives anymore.
-		for (const tabKey of touched) {
-			this.#detachIfUnheld(tabKey);
-			const tab = this.#tabs.get(tabKey);
-			if (tab?.attached && tab.focusManaged) void this.#syncFocus(tab).catch(() => {});
-		}
+		for (const tabKey of touched) this.#detachIfUnheld(tabKey);
 		this.#log("cdp client closed", { conn: connId });
 	}
 
@@ -632,11 +605,9 @@ export class RelayBridge {
 			return;
 		}
 		const ref = conn.sessions.get(sessionId);
-		const cleanup = isWorkspaceCleanupCommand(msg.method, msg.params);
 		if (ref) {
 			const tab = this.#tabs.get(ref.tabKey);
-			if (!tab || !this.#eligible(tab, cleanup || ref.kind === "tab"))
-				throw new Error("Workspace tab is unavailable or paused");
+			if (!tab || !this.#eligible(tab)) throw new Error("Workspace tab is unavailable");
 		}
 		if (ref?.kind === "tab") {
 			this.#handleTabSessionCommand(conn, msg, ref);
@@ -777,12 +748,9 @@ export class RelayBridge {
 			return;
 		}
 		const cleanup = isWorkspaceCleanupCommand(msg.method, msg.params);
-		if (!this.#eligible(tab, cleanup)) throw new Error("Workspace tab is unavailable or paused");
+		if (!this.#eligible(tab)) throw new Error("Workspace tab is unavailable");
 		if (msg.method === "OMP.claimTarget") {
 			conn.affineInstanceId = tab.instanceId;
-			conn.focusTabs.add(tabKey);
-			tab.focusManaged = true;
-			await this.#syncFocus(tab);
 			this.#reply(conn, msg, {});
 			return;
 		}
@@ -797,12 +765,6 @@ export class RelayBridge {
 		if (msg.method === "Emulation.setFocusEmulationEnabled") {
 			if (realSessionId) throw new Error("Focus emulation must address the workspace page");
 			if (typeof msg.params?.enabled !== "boolean") throw new Error("Focus emulation requires boolean enabled");
-			if (msg.params.enabled) conn.focusTabs.add(tabKey);
-			else conn.focusTabs.delete(tabKey);
-			tab.focusManaged = true;
-			await this.#syncFocus(tab);
-			this.#reply(conn, msg, {});
-			return;
 		}
 		if (msg.method === "Page.bringToFront") {
 			await this.#rpc({ op: "activateTab", tabId: tab.tabId }, this.#instanceFor(tab));
@@ -813,6 +775,9 @@ export class RelayBridge {
 			throw new Error(`'${msg.method}' is not supported on a workspace page`);
 		}
 		let params = msg.params;
+		// Visible shared pages use actual browser focus. Keep the stock CDP
+		// request/response contract without enabling native focus emulation.
+		if (msg.method === "Emulation.setFocusEmulationEnabled") params = { enabled: false };
 		if (msg.method.startsWith("Target.")) {
 			const child = msg.params?.sessionId;
 			const childRef = typeof child === "string" ? this.#realSessionTabs.get(child) : undefined;
@@ -915,7 +880,7 @@ export class RelayBridge {
 			case "Target.getTargets": {
 				const targetInfos: TargetInfo[] = [];
 				for (const tab of this.#tabs.values()) {
-					if (this.#eligible(tab, true) && !tab.discarded) targetInfos.push(this.#pageInfo(tab, tab.attached));
+					if (this.#eligible(tab) && !tab.discarded) targetInfos.push(this.#pageInfo(tab, tab.attached));
 				}
 				this.#reply(conn, msg, { targetInfos });
 				return;
@@ -1026,8 +991,7 @@ export class RelayBridge {
 			case "Target.activateTarget": {
 				const parsed = typeof msg.params?.targetId === "string" ? parseTargetId(msg.params.targetId) : null;
 				const activatedTab = parsed ? this.#tabs.get(parsed.key) : undefined;
-				if (!activatedTab || !this.#eligible(activatedTab))
-					throw new Error("Workspace target is unavailable or paused");
+				if (!activatedTab || !this.#eligible(activatedTab)) throw new Error("Workspace target is unavailable");
 				await this.#rpc({ op: "activateTab", tabId: activatedTab.tabId }, this.#instanceFor(activatedTab));
 				this.#reply(conn, msg, {});
 				return;
@@ -1040,7 +1004,7 @@ export class RelayBridge {
 				}
 				const parsed = typeof raw === "string" ? parseTargetId(raw) : null;
 				const tab = parsed ? this.#tabs.get(parsed.key) : undefined;
-				if (parsed && tab && this.#eligible(tab, true)) {
+				if (parsed && tab && this.#eligible(tab)) {
 					const info =
 						parsed.kind === "tab" ? this.#tabInfo(tab, tab.attached) : this.#pageInfo(tab, tab.attached);
 					this.#reply(conn, msg, { targetInfo: info });
@@ -1166,7 +1130,7 @@ export class RelayBridge {
 		tab.attached = false;
 		tab.attaching = null;
 		this.#resetRuntime(tab);
-		tab.banned = !this.#instances.get(tab.instanceId)?.workspacePaused;
+		tab.banned = true;
 		this.#retractTab(tab);
 	}
 
@@ -1182,9 +1146,6 @@ export class RelayBridge {
 			this.#pendingRpc.delete(key);
 		}
 		this.#tabs.delete(tabKey);
-		for (const conn of this.#conns.values()) {
-			conn.focusTabs.delete(tabKey);
-		}
 	}
 
 	#onTabUpsert(snap: TabSnapshot, instanceId: string, opts: { silent?: boolean } = {}): void {
@@ -1216,8 +1177,8 @@ export class RelayBridge {
 			this.#detachIfUnheld(key);
 			return;
 		}
-		const eligible = this.#eligible(tab, true);
-		if (eligible && !tab.announced && !inst.workspacePaused) {
+		const eligible = this.#eligible(tab);
+		if (eligible && !tab.announced) {
 			tab.announced = true;
 			for (const conn of this.#conns.values()) {
 				if (!conn.discover) continue;
@@ -1306,10 +1267,6 @@ export class RelayBridge {
 		// or it outlives every downstream session: the infobar stays up, and
 		// dismissing it bans the tab for the rest of the epoch.
 		this.#detachIfUnheld(ref.tabKey);
-		if (conn.sessionsForTab(ref.tabKey).length === 0 && conn.focusTabs.delete(ref.tabKey)) {
-			const tab = this.#tabs.get(ref.tabKey);
-			if (tab?.attached) void this.#syncFocus(tab).catch(() => {});
-		}
 	}
 
 	/**
@@ -1330,28 +1287,6 @@ export class RelayBridge {
 				if (tab.detaching === done) tab.detaching = null;
 			});
 		tab.detaching = done;
-	}
-
-	/** Serialize aggregate focus changes so one client cannot release another client's lease. */
-	#syncFocus(tab: TabState): Promise<void> {
-		const next = tab.focusUpdating
-			.catch(() => {})
-			.then(async () => {
-				if (!tab.attached || this.#tabs.get(tab.tabKey) !== tab) return;
-				let enabled = false;
-				for (const conn of this.#conns.values()) {
-					if (conn.focusTabs.has(tab.tabKey)) {
-						enabled = true;
-						break;
-					}
-				}
-				await this.#rpc(
-					{ op: "send", tabId: tab.tabId, method: "Emulation.setFocusEmulationEnabled", params: { enabled } },
-					this.#instanceFor(tab),
-				);
-			});
-		tab.focusUpdating = next;
-		return next;
 	}
 
 	#instanceForNewTab(conn: CdpConnection, nearTargetId: unknown, near?: TabState): ExtInstance | undefined {
@@ -1431,7 +1366,6 @@ export class RelayBridge {
 				if (tab.discarded || !this.#eligible(tab) || this.#tabs.get(tab.tabKey) !== tab) return false;
 				tab.attached = true;
 				tab.reattachedAfterDetach = true;
-				if (tab.focusManaged) return this.#syncFocus(tab).then(() => true);
 				return true;
 			})
 			.catch(err => {
@@ -1450,18 +1384,12 @@ export class RelayBridge {
 		return await attempt;
 	}
 
-	#eligible(tab: TabState, allowPaused = false): boolean {
+	#eligible(tab: TabState): boolean {
 		if (tab.banned || this.#tabs.get(tab.tabKey) !== tab) return false;
 		// A browser whose extension socket is gone cannot be driven; hide its
 		// tabs from discovery until the instance reconnects.
 		const inst = this.#instances.get(tab.instanceId);
-		if (
-			!inst?.socket ||
-			(!allowPaused && inst.workspacePaused) ||
-			inst.workspaceWindowId === null ||
-			inst.workspaceWindowId !== tab.windowId
-		)
-			return false;
+		if (!inst?.socket || inst.workspaceWindowId === null || inst.workspaceWindowId !== tab.windowId) return false;
 		if (!tab.url) return true;
 		return !INELIGIBLE_URL.test(tab.url);
 	}
@@ -1523,15 +1451,12 @@ export class RelayBridge {
 
 	#rpc(req: RelayRpcRequest, inst: ExtInstance, timeoutMs = RPC_TIMEOUT_MS): Promise<unknown> {
 		if (!inst.socket) return Promise.reject(new Error("relay extension is not connected"));
-		const cleanup = req.op === "send" && isWorkspaceCleanupCommand(req.method, req.params);
 		if (req.op !== "detach") {
-			if (inst.workspacePaused && !cleanup)
-				return Promise.reject(new Error("Agent workspace is paused while its window is focused"));
 			if (req.op !== "createTab") {
 				if (inst.workspaceWindowId === null)
 					return Promise.reject(new Error("Agent workspace window is unavailable"));
 				const tab = this.#tabs.get(tabKeyOf(inst.code, req.tabId));
-				if (!tab || !this.#eligible(tab, cleanup))
+				if (!tab || !this.#eligible(tab))
 					return Promise.reject(new Error("Tab is not available in the agent workspace"));
 			}
 		}
@@ -1543,7 +1468,9 @@ export class RelayBridge {
 		}, timeoutMs);
 		// Creation/removal may publish a lifecycle event before their RPC acknowledgement.
 		const tabKey = req.op === "createTab" || req.op === "removeTab" ? undefined : tabKeyOf(inst.code, req.tabId);
-		this.#pendingRpc.set(`${inst.instanceId}:${id}`, { resolve, reject, timer, tabKey, cleanup });
+		const lifecycleWindowId =
+			req.op === "removeTab" || req.op === "createTab" ? (inst.workspaceWindowId ?? undefined) : undefined;
+		this.#pendingRpc.set(`${inst.instanceId}:${id}`, { resolve, reject, timer, tabKey, lifecycleWindowId });
 		inst.socket.send(JSON.stringify({ t: "rpc", id, ...req } satisfies RelayToExtMessage));
 		return promise;
 	}

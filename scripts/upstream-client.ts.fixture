@@ -21,6 +21,7 @@ interface Tab {
 	mouseMove(x: number, y: number, options?: { steps: number }): Promise<void>;
 	mouseDown(): Promise<void>;
 	mouseUp(): Promise<void>;
+	drag(from: string | { x: number; y: number }, to: string | { x: number; y: number }): Promise<void>;
 	evaluate<Args extends unknown[], Result>(fn: (...args: Args) => Result, ...args: Args): Promise<Awaited<Result>>;
 	screenshot(options?: { selector?: string; format?: "png"; ifChanged?: boolean }): Promise<unknown>;
 	emulate(options: { viewport: { width: number; height: number; scale: number } }): Promise<unknown>;
@@ -221,6 +222,18 @@ try {
 	}));
 	assert.equal(canvas.finished, "yes");
 	assert.deepEqual(canvas.pixel, [221, 34, 34, 255]);
+	await main.evaluate(() => {
+		const canvas = document.querySelector("canvas")!;
+		canvas.getContext("2d")!.clearRect(0, 0, canvas.width, canvas.height);
+		delete canvas.dataset.finished;
+	});
+	await main.drag({ x: box.x + 21, y: box.y + 41 }, { x: box.x + 221, y: box.y + 41 });
+	const dragged = record(await main.evaluate(() => {
+		const canvas = document.querySelector("canvas")!;
+		return { finished: canvas.dataset.finished, pixel: [...canvas.getContext("2d")!.getImageData(80, 40, 1, 1).data] };
+	}));
+	assert.equal(dragged.finished, "yes");
+	assert.deepEqual(dragged.pixel, [221, 34, 34, 255]);
 	await errorMatches(() => main.fill("#absent-real-selector", "must fail"), /selector|element|found|timeout|timed out/i);
 	await errorMatches(() => main.evaluate(() => { throw new Error("REAL_PAGE_EXCEPTION_SENTINEL"); }), /REAL_PAGE_EXCEPTION_SENTINEL/);
 	await errorMatches(() => browser.open({ name: "missing-target", app: { target: "NO_SUCH_RELAY_TARGET_SENTINEL" } }), /target|match|found/i);

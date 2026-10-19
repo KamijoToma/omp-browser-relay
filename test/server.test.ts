@@ -1,14 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { RELAY_CAPABILITIES, RELAY_PROTOCOL_VERSION } from "../src/protocol";
 import { type RelayServer, type RelayUnavailableInfo, startRelayServer } from "../src/server";
 
 const EXTENSION_HELLO = {
 	t: "hello",
-	protocolVersion: 2,
+	protocolVersion: RELAY_PROTOCOL_VERSION,
 	browserSession: "test-run",
 	discardedTabsProtocol: 1,
 	instanceId: "test",
 	workspaceWindowId: 1,
-	workspacePaused: false,
 	userAgent: "test",
 	browserVersion: "Chrome/151.0.0.0",
 	tabs: [],
@@ -117,6 +117,54 @@ describe("browser relay discovery endpoint", () => {
 		return port;
 	}
 
+	it("serves capabilities and its canonical reference before the extension connects", async () => {
+		relay = startRelayServer({ port: 0, token: "secret" });
+		const base = `http://127.0.0.1:${relay.port}`;
+		const response = await fetch(`${base}/capabilities`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("access-control-allow-origin")).toBeNull();
+		const capabilities = await response.json();
+		expect(capabilities.backend).toEqual({
+			supported: true,
+			transport: "cdp",
+			ready: false,
+			extensionSeen: false,
+		});
+		const docs = await fetch(new URL(capabilities.docs.path, base));
+		expect(docs.status).toBe(200);
+		expect(docs.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
+		expect(docs.headers.get("access-control-allow-origin")).toBeNull();
+		expect((await fetch(`${base}/capabilities`, { method: "POST" })).status).toBe(405);
+		expect((await fetch(`${base}/docs`, { method: "POST" })).status).toBe(405);
+		expect((await fetch(`${base}/json/version`)).status).toBe(503);
+	});
+
+	it("reports live readiness separately from supported capabilities", async () => {
+		const port = await startReadyRelay();
+		const base = `http://127.0.0.1:${port}`;
+		const capabilities = await (await fetch(`${base}/capabilities`)).json();
+		expect(capabilities.backend).toEqual({
+			supported: true,
+			transport: "cdp",
+			ready: true,
+			extensionSeen: true,
+		});
+		extension!.close();
+		const deadline = Date.now() + 1_000;
+		let disconnected = await (await fetch(`${base}/capabilities`)).json();
+		while (disconnected.backend.ready && Date.now() < deadline) {
+			disconnected = await (await fetch(`${base}/capabilities`)).json();
+		}
+		expect(disconnected.backend).toEqual({
+			supported: true,
+			transport: "cdp",
+			ready: false,
+			extensionSeen: true,
+		});
+		expect(disconnected.ompRelay).toEqual(capabilities.ompRelay);
+		expect((await fetch(`${base}/docs`)).status).toBe(200);
+	});
+
 	it("advertises the requested Host authority so a remote Puppeteer client dials the relay", async () => {
 		const port = await startReadyRelay();
 		const response = await rawGet(
@@ -124,7 +172,7 @@ describe("browser relay discovery endpoint", () => {
 			"GET /json/version HTTP/1.1\r\nHost: 100.100.92.97:12803\r\nConnection: close\r\n\r\n",
 		);
 		expect(parseVersion(response).webSocketDebuggerUrl).toBe("ws://100.100.92.97:12803/cdp");
-		expect(parseVersion(response).ompRelay).toEqual({ protocolVersion: 2, windowIsolation: "dedicated-window" });
+		expect(parseVersion(response).ompRelay).toEqual(RELAY_CAPABILITIES);
 	});
 
 	it("uses the loopback discovery URL when an HTTP/1.0 request has no Host header", async () => {
@@ -156,7 +204,7 @@ describe("browser relay discovery endpoint", () => {
 		const info = (await response.json()) as RelayUnavailableInfo;
 		expect(info.extensionSeen).toBeFalse();
 		expect(info.uptimeMs).toBeGreaterThanOrEqual(0);
-		expect(info.ompRelay).toEqual({ protocolVersion: 2, windowIsolation: "dedicated-window" });
+		expect(info.ompRelay).toEqual(RELAY_CAPABILITIES);
 	});
 
 	it("keeps extensionSeen=true across an extension disconnect so clients wait for the service-worker revival", async () => {

@@ -15,10 +15,13 @@ for (const [entry, outdir, target] of [
 	if (!result.success) throw new AggregateError(result.logs, `Failed to build ${entry}`);
 }
 
-for (const name of ["manifest.json", "options.html", "options.js", "workspace.html"]) {
+for (const name of ["manifest.json", "options.html", "options.js"]) {
 	await Bun.write(path.join(extension, name), Bun.file(path.join(root, "extension", name)));
 }
 await Bun.write(path.join(extension, "LICENSE"), Bun.file(path.join(root, "LICENSE")));
+await fs.cp(path.join(root, "skills", "omp-browser-relay"), path.join(dist, "skills", "omp-browser-relay"), {
+	recursive: true,
+});
 await fs.chmod(path.join(dist, "cli.js"), 0o755);
 
 const zip = await $`zip -qr ../omp-browser-relay-extension.zip .`.cwd(extension).quiet().nothrow();

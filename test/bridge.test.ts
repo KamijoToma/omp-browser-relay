@@ -84,12 +84,11 @@ function connect(
 		socket,
 		JSON.stringify({
 			t: "hello",
-			protocolVersion: 2,
+			protocolVersion: 3,
 			browserSession,
 			discardedTabsProtocol: 1,
 			instanceId: "anon",
 			workspaceWindowId: 1,
-			workspacePaused: false,
 			userAgent: "test",
 			browserVersion: "Chrome/151.0.0.0",
 			tabs,
@@ -111,11 +110,10 @@ function connectInstance(
 		JSON.stringify({
 			t: "hello",
 			instanceId,
-			protocolVersion: 2,
+			protocolVersion: 3,
 			browserSession: "test-run",
 			discardedTabsProtocol: 1,
 			workspaceWindowId: 1,
-			workspacePaused: false,
 			userAgent: "test",
 			browserVersion: instanceId === "edge" ? "Edg/151.0.0.0" : "Chrome/151.0.0.0",
 			tabs,
@@ -403,7 +401,7 @@ describe("RelayBridge browser target sessions", () => {
 		expect(ext.messages).toEqual([]);
 	});
 
-	it("retains paused owned targets after refused close without discovering or attaching pages", async () => {
+	it("retains owned targets after a refused close without attaching pages", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [
@@ -411,17 +409,10 @@ describe("RelayBridge browser target sessions", () => {
 			tab({ tabId: 2, windowId: 7 }),
 			tab({ tabId: 3, url: "chrome://settings/" }),
 		]);
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: true }));
 		const cdp = new FakeCdpSocket();
 		const conn = bridge.cdpConnected(cdp);
 		const sessionId = attachBrowser(bridge, cdp, conn);
-		expect(cdp.messages.filter(message => message.method === "Target.targetCreated")).toHaveLength(1);
-		for (const method of ["Target.closeTarget", "Target.activateTarget", "Target.attachToTarget"]) {
-			const id = ++msgSeq;
-			bridge.cdpMessage(conn, JSON.stringify({ id, sessionId, method, params: { targetId: `PAGE${ANON}.1` } }));
-			await flush();
-			expect(cdp.messages.find(message => message.id === id)?.error).toBeDefined();
-		}
+		expect(cdp.messages.filter(message => message.method === "Target.targetCreated")).toHaveLength(3);
 		for (const querySession of [undefined, sessionId]) {
 			const id = ++msgSeq;
 			bridge.cdpMessage(conn, JSON.stringify({ id, sessionId: querySession, method: "Target.getTargets" }));
@@ -440,7 +431,6 @@ describe("RelayBridge browser target sessions", () => {
 		}
 		expect(bridge.listTargets().map(target => target.id)).toEqual([`PAGE${ANON}.1`]);
 		expect(ext.messages).toEqual([]);
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: false }));
 		const closeId = ++msgSeq;
 		bridge.cdpMessage(
 			conn,
@@ -459,6 +449,56 @@ describe("RelayBridge browser target sessions", () => {
 			error: { message: "close refused" },
 		});
 		expect(bridge.listTargets().map(target => target.id)).toEqual([`PAGE${ANON}.1`]);
+	});
+
+	it("preserves last-tab close acknowledgement while retiring its window and rejecting other work", async () => {
+		const bridge = new RelayBridge();
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, conn, 1);
+		const inputId = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: inputId,
+				sessionId,
+				method: "Input.dispatchMouseEvent",
+				params: { type: "mouseMoved", x: 10, y: 20 },
+			}),
+		);
+		const closeId = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({ id: closeId, method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.1` } }),
+		);
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: null }));
+		bridge.extMessage(ext, JSON.stringify({ t: "tabRemoved", tabId: 1 }));
+		ack(bridge, ext, "removeTab", {});
+		await flush();
+		expect(cdp.messages.find(message => message.id === closeId)?.result).toEqual({ success: true });
+		expect(cdp.messages.find(message => message.id === inputId)?.error).toBeDefined();
+		expect(bridge.listTargets()).toEqual([]);
+	});
+
+	it("preserves fresh-page provisioning across retirement of its previous workspace", async () => {
+		const bridge = new RelayBridge(),
+			ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket(),
+			conn = bridge.cdpConnected(cdp),
+			id = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({ id, method: "Target.createTarget", params: { url: "https://replacement.example" } }),
+		);
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: null }));
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 7 }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 2, windowId: 7, url: "https://replacement.example" }) });
+		await flush();
+		expect(cdp.messages.find(message => message.id === id)?.result).toEqual({ targetId: `PAGE${ANON}.2` });
+		expect(bridge.listTargets().map(target => target.url)).toEqual(["https://replacement.example"]);
 	});
 });
 
@@ -597,12 +637,11 @@ describe("RelayBridge Runtime sessions", () => {
 			nextExt,
 			JSON.stringify({
 				t: "hello",
-				protocolVersion: 2,
+				protocolVersion: 3,
 				browserSession: "test-run",
 				discardedTabsProtocol: 1,
 				instanceId: "anon",
 				workspaceWindowId: 1,
-				workspacePaused: false,
 				userAgent: "test",
 				browserVersion: "Chrome/151.0.0.0",
 				tabs: [tab({ tabId: 1 })],
@@ -1181,11 +1220,11 @@ describe("RelayBridge dedicated workspace boundary", () => {
 		for (const overrides of [
 			{ protocolVersion: undefined },
 			{ protocolVersion: 1 },
+			{ protocolVersion: 2 },
 			{ instanceId: "" },
 			{ instanceId: undefined },
 			{ instanceId: "bad:instance" },
 			{ workspaceWindowId: "1" },
-			{ workspacePaused: undefined },
 			{ attachedTabIds: ["1"] },
 			{ tabs: [null] },
 		]) {
@@ -1196,14 +1235,13 @@ describe("RelayBridge dedicated workspace boundary", () => {
 				ext,
 				JSON.stringify({
 					t: "hello",
-					protocolVersion: 2,
+					protocolVersion: 3,
 					browserSession: "test-run",
 					discardedTabsProtocol: 1,
 					instanceId: "valid",
 					userAgent: "test",
 					browserVersion: "Chrome/151",
 					workspaceWindowId: 1,
-					workspacePaused: false,
 					tabs: [],
 					attachedTabIds: [],
 					...overrides,
@@ -1232,7 +1270,7 @@ describe("RelayBridge dedicated workspace boundary", () => {
 		expect(ext.messages).toEqual([]);
 	});
 
-	it("revokes page and real child sessions when a tab leaves its workspace", async () => {
+	it("revokes page and real child sessions on move-out without reviving them on adoption", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
@@ -1248,8 +1286,15 @@ describe("RelayBridge dedicated workspace boundary", () => {
 				params: { sessionId: "child", targetInfo: { targetId: "frame", type: "iframe" } },
 			}),
 		);
+		const evaluation = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ id: evaluation, sessionId, method: "Runtime.evaluate" }));
 		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 1, windowId: 7 }) }));
 		expect(bridge.listTargets()).toEqual([]);
+		await flush();
+		expect(cdp.messages.find(message => message.id === evaluation)?.error).toBeDefined();
+		ack(bridge, ext, "send");
+		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 1 }) }));
+		expect(bridge.listTargets().map(target => target.id)).toEqual([`PAGE${ANON}.1`]);
 		for (const session of [sessionId, `SC${ANON}.1.child`]) {
 			const id = ++msgSeq;
 			bridge.cdpMessage(conn, JSON.stringify({ id, sessionId: session, method: "Page.bringToFront" }));
@@ -1258,6 +1303,13 @@ describe("RelayBridge dedicated workspace boundary", () => {
 		}
 		expect(ext.rpcs("activateTab")).toEqual([]);
 		expect(cdp.messages.some(message => message.method === "Target.detachedFromTarget")).toBeTrue();
+		const adopted = await attachPage(bridge, ext, cdp, conn, 1);
+		expect(adopted).not.toBe(sessionId);
+		const evaluateAdopted = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ id: evaluateAdopted, sessionId: adopted, method: "Runtime.evaluate" }));
+		ack(bridge, ext, "send");
+		await flush();
+		expect(cdp.messages.find(message => message.id === evaluateAdopted)?.result).toEqual({});
 	});
 
 	it("bootstraps an absent workspace and recreates it after close without retaining old sessions", async () => {
@@ -1268,14 +1320,13 @@ describe("RelayBridge dedicated workspace boundary", () => {
 			ext,
 			JSON.stringify({
 				t: "hello",
-				protocolVersion: 2,
+				protocolVersion: 3,
 				browserSession: "test-run",
 				discardedTabsProtocol: 1,
 				instanceId: "anon",
 				userAgent: "test",
 				browserVersion: "Chrome/151",
 				workspaceWindowId: null,
-				workspacePaused: false,
 				tabs: [],
 				attachedTabIds: [],
 			}),
@@ -1284,13 +1335,13 @@ describe("RelayBridge dedicated workspace boundary", () => {
 		const conn = bridge.cdpConnected(cdp);
 		const first = ++msgSeq;
 		bridge.cdpMessage(conn, JSON.stringify({ id: first, method: "Target.createTarget" }));
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: false }));
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1 }));
 		ack(bridge, ext, "createTab", { tab: tab({ tabId: 1 }) });
 		await flush();
 		expect(cdp.messages.find(message => message.id === first)?.result).toEqual({ targetId: `PAGE${ANON}.1` });
 		const session = await attachPage(bridge, ext, cdp, conn, 1);
 
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: null, paused: false }));
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: null }));
 		expect(bridge.listTargets()).toEqual([]);
 		const stale = ++msgSeq;
 		bridge.cdpMessage(conn, JSON.stringify({ id: stale, sessionId: session, method: "Runtime.evaluate" }));
@@ -1299,14 +1350,14 @@ describe("RelayBridge dedicated workspace boundary", () => {
 
 		const replacement = ++msgSeq;
 		bridge.cdpMessage(conn, JSON.stringify({ id: replacement, method: "Target.createTarget" }));
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 2, paused: false }));
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 2 }));
 		ack(bridge, ext, "createTab", { tab: tab({ tabId: 4, windowId: 2 }) });
 		await flush();
 		expect(cdp.messages.find(message => message.id === replacement)?.result).toEqual({ targetId: `PAGE${ANON}.4` });
 		expect(bridge.listTargets().map(target => target.id)).toEqual([`PAGE${ANON}.4`]);
 	});
 
-	it("pauses control but permits teardown and resumes the original session after updates", async () => {
+	it("keeps active workspace pages controllable through membership and user tab updates", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
@@ -1314,98 +1365,60 @@ describe("RelayBridge dedicated workspace boundary", () => {
 		const conn = bridge.cdpConnected(cdp);
 		bridge.cdpMessage(conn, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets" }));
 		const sessionId = await attachPage(bridge, ext, cdp, conn, 1);
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: true }));
+		const evaluation = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ id: evaluation, sessionId, method: "Runtime.evaluate" }));
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1 }));
 		bridge.extMessage(
 			ext,
 			JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 1, title: "User editing", active: true }) }),
 		);
-		for (const method of ["Page.bringToFront", "Runtime.enable", "Runtime.disable"]) {
-			const id = ++msgSeq;
-			bridge.cdpMessage(conn, JSON.stringify({ id, sessionId, method }));
-			await flush();
-			expect(cdp.messages.find(message => message.id === id)?.error).toBeDefined();
-		}
-		expect(ext.rpcs("send")).toEqual([]);
-		const acceptWhilePaused = ++msgSeq;
-		bridge.cdpMessage(
-			conn,
-			JSON.stringify({
-				id: acceptWhilePaused,
-				sessionId,
-				method: "Page.handleJavaScriptDialog",
-				params: { accept: true },
-			}),
-		);
+		ack(bridge, ext, "send", { result: { type: "number", value: 42 } });
 		await flush();
-		expect(cdp.messages.find(message => message.id === acceptWhilePaused)?.error).toBeDefined();
-		const dismissalId = ++msgSeq;
-		bridge.cdpMessage(
-			conn,
-			JSON.stringify({
-				id: dismissalId,
-				sessionId,
-				method: "Page.handleJavaScriptDialog",
-				params: { accept: false },
-			}),
-		);
-		expect(ext.pending("send").map(rpc => [rpc.method, rpc.params])).toEqual([
-			["Page.handleJavaScriptDialog", { accept: false }],
-		]);
-		ack(bridge, ext, "send");
-		await flush();
-		expect(cdp.messages.find(message => message.id === dismissalId)?.result).toEqual({});
+		expect(cdp.messages.find(message => message.id === evaluation)?.result).toEqual({
+			result: { type: "number", value: 42 },
+		});
+		expect(bridge.listTargets()[0]).toMatchObject({ title: "User editing", active: "true" });
 		for (const [method, params] of [
+			["Page.handleJavaScriptDialog", { accept: true }],
+			["Page.handleJavaScriptDialog", { accept: false }],
 			["Page.screencastFrameAck", { sessionId: 7 }],
 			["Page.stopScreencast", {}],
 			["Fetch.continueRequest", { requestId: "blocked-request" }],
 		] as const) {
-			const cleanupId = ++msgSeq;
-			bridge.cdpMessage(conn, JSON.stringify({ id: cleanupId, sessionId, method, params }));
+			const id = ++msgSeq;
+			bridge.cdpMessage(conn, JSON.stringify({ id, sessionId, method, params }));
+			expect(ext.pending("send")[0]).toMatchObject({ tabId: 1, method, params });
 			ack(bridge, ext, "send");
 			await flush();
-			expect(cdp.messages.find(message => message.id === cleanupId)?.result).toEqual({});
+			expect(cdp.messages.find(message => message.id === id)?.result).toEqual({});
 		}
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: false }));
-		const acceptAfterResume = ++msgSeq;
-		bridge.cdpMessage(
-			conn,
-			JSON.stringify({
-				id: acceptAfterResume,
-				sessionId,
-				method: "Page.handleJavaScriptDialog",
-				params: { accept: true },
-			}),
-		);
-		expect(ext.pending("send")[0]?.params).toEqual({ accept: true });
-		ack(bridge, ext, "send");
-		await flush();
-		expect(cdp.messages.find(message => message.id === acceptAfterResume)?.result).toEqual({});
-		const id = ++msgSeq;
-		bridge.cdpMessage(conn, JSON.stringify({ id, sessionId, method: "Page.bringToFront" }));
-		ack(bridge, ext, "activateTab");
-		await flush();
-		expect(cdp.messages.find(message => message.id === id)?.result).toEqual({});
-		expect(bridge.listTargets()).toHaveLength(1);
+		expect(cdp.messages.filter(message => message.method === "Target.detachedFromTarget")).toEqual([]);
 	});
 
-	it("does not permanently ban an attach interrupted by workspace pause", async () => {
+	it("cancels an in-flight attach when workspace ownership changes and adopts new members", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
 		const conn = bridge.cdpConnected(cdp);
+		const interrupted = ++msgSeq;
 		bridge.cdpMessage(
 			conn,
 			JSON.stringify({
-				id: ++msgSeq,
+				id: interrupted,
 				method: "Target.attachToTarget",
 				params: { targetId: `PAGE${ANON}.1` },
 			}),
 		);
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: true }));
+		const stale = ext.pending("attach")[0]!;
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 2 }));
+		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 2, windowId: 2 }) }));
+		ext.markAcked(stale.id);
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: stale.id, ok: true, result: {} }));
 		await flush();
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: false }));
-		const sessionId = await attachPage(bridge, ext, cdp, conn, 1);
+		expect(cdp.messages.find(message => message.id === interrupted)?.error).toBeDefined();
+		expect(bridge.listTargets().map(target => target.id)).toEqual([`PAGE${ANON}.2`]);
+		const sessionId = await attachPage(bridge, ext, cdp, conn, 2);
 		expect(sessionId).toBeDefined();
 	});
 
@@ -1658,7 +1671,7 @@ describe("stock omp relay compatibility", () => {
 		expect(next.rpcs("send")).toEqual([]);
 	});
 
-	it("retains another client's focus lease and releases the final lease even during user takeover", async () => {
+	it("never enables native focus when clients request focus emulation and releases only unheld tabs", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
@@ -1668,41 +1681,105 @@ describe("stock omp relay compatibility", () => {
 		const connB = bridge.cdpConnected(second);
 		const pageA = await attachPage(bridge, ext, first, connA, 1);
 		const pageB = await attachPage(bridge, ext, second, connB, 1);
-		for (const [conn, page, enabled] of [
-			[connA, pageA, true],
-			[connB, pageB, true],
-			[connA, pageA, false],
+		for (const [conn, cdp, page, enabled] of [
+			[connA, first, pageA, true],
+			[connB, second, pageB, true],
+			[connA, first, pageA, false],
 		] as const) {
 			const id = ++msgSeq;
 			bridge.cdpMessage(
 				conn,
 				JSON.stringify({ id, sessionId: page, method: "Emulation.setFocusEmulationEnabled", params: { enabled } }),
 			);
-			await flush();
-			expect(ext.pending("send").at(-1)?.params).toEqual({ enabled: true });
-			ack(bridge, ext, "send");
-			await flush();
-		}
-		bridge.cdpClosed(connB);
-		await flush();
-		expect(ext.pending("send").at(-1)?.params).toEqual({ enabled: false });
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: true }));
-		ack(bridge, ext, "send");
-		await flush();
-		const release = ++msgSeq;
-		bridge.cdpMessage(
-			connA,
-			JSON.stringify({
-				id: release,
-				sessionId: pageA,
+			expect(ext.pending("send")[0]).toMatchObject({
+				tabId: 1,
 				method: "Emulation.setFocusEmulationEnabled",
 				params: { enabled: false },
+			});
+			ack(bridge, ext, "send");
+			await flush();
+			expect(cdp.messages.find(message => message.id === id)?.result).toEqual({});
+		}
+		bridge.cdpClosed(connB);
+		expect(ext.rpcs("detach")).toEqual([]);
+		expect(ext.pending("send")).toEqual([]);
+		const evaluate = ++msgSeq;
+		bridge.cdpMessage(connA, JSON.stringify({ id: evaluate, sessionId: pageA, method: "Runtime.evaluate" }));
+		ack(bridge, ext, "send");
+		await flush();
+		expect(first.messages.find(message => message.id === evaluate)?.result).toEqual({});
+		bridge.cdpClosed(connA);
+		expect(ext.pending("detach").map(request => request.tabId)).toEqual([1]);
+		ack(bridge, ext, "detach");
+		await flush();
+	});
+
+	it("rejects malformed focus requests and child-session focus changes", async () => {
+		const bridge = new RelayBridge();
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const page = await attachPage(bridge, ext, cdp, conn, 1);
+		bridge.extMessage(
+			ext,
+			JSON.stringify({
+				t: "cdpEvent",
+				tabId: 1,
+				method: "Target.attachedToTarget",
+				params: { sessionId: "child", targetInfo: { targetId: "frame", type: "iframe" } },
+			}),
+		);
+		for (const params of [undefined, {}, { enabled: "true" }, { enabled: 1 }, { enabled: null }]) {
+			const id = ++msgSeq;
+			bridge.cdpMessage(
+				conn,
+				JSON.stringify({ id, sessionId: page, method: "Emulation.setFocusEmulationEnabled", params }),
+			);
+			await flush();
+			expect(cdp.messages.find(message => message.id === id)?.error).toBeDefined();
+		}
+		const child = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: child,
+				sessionId: `SC${ANON}.1.child`,
+				method: "Emulation.setFocusEmulationEnabled",
+				params: { enabled: true },
 			}),
 		);
 		await flush();
-		ack(bridge, ext, "send");
+		expect(cdp.messages.find(message => message.id === child)?.error).toBeDefined();
+		expect(ext.rpcs("send")).toEqual([]);
+	});
+
+	it("uses claimTarget as browser affinity without changing native focus", async () => {
+		const bridge = new RelayBridge();
+		const chrome = new FakeExtSocket();
+		const edge = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1 })]);
+		connectInstance(bridge, edge, "edge", [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const page = await attachPage(bridge, chrome, cdp, conn, 1, "chrome");
+		const claim = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ id: claim, sessionId: page, method: "OMP.claimTarget" }));
+		expect(cdp.messages.find(message => message.id === claim)?.result).toEqual({});
+		expect(chrome.rpcs("send")).toEqual([]);
+		expect(edge.rpcs("send")).toEqual([]);
+		const create = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({ id: create, method: "Target.createTarget", params: { url: "https://example.com/new" } }),
+		);
+		expect(chrome.pending("createTab")).toHaveLength(1);
+		expect(edge.rpcs("createTab")).toEqual([]);
+		ack(bridge, chrome, "createTab", { tab: tab({ tabId: 2, url: "https://example.com/new" }) });
 		await flush();
-		expect(first.messages.find(message => message.id === release)?.result).toEqual({});
+		expect(cdp.messages.find(message => message.id === create)?.result).toEqual({
+			targetId: `PAGE${instanceCode("chrome")}.2`,
+		});
 	});
 
 	it("routes a page-scoped create to its own browser rather than the last extension to connect", async () => {
@@ -1748,7 +1825,7 @@ describe("stock omp relay compatibility", () => {
 });
 
 describe("relay initialization interruptions", () => {
-	it("completes the synthetic tab hierarchy while paused without allowing page control", async () => {
+	it("completes the synthetic tab hierarchy across unchanged workspace notifications", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
@@ -1758,7 +1835,7 @@ describe("relay initialization interruptions", () => {
 		ack(bridge, ext, "attach");
 		await flush();
 		const tabSession = cdp.attachedSessions()[0]!;
-		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1, paused: true }));
+		bridge.extMessage(ext, JSON.stringify({ t: "workspace", windowId: 1 }));
 		const handshake = ++msgSeq;
 		bridge.cdpMessage(
 			conn,
@@ -1772,11 +1849,12 @@ describe("relay initialization interruptions", () => {
 		expect(cdp.messages.find(message => message.id === handshake)?.result).toEqual({});
 		const pageSession = cdp.attachedSessions()[1]!;
 		expect(pageSession).toBeDefined();
-		const denied = ++msgSeq;
-		bridge.cdpMessage(conn, JSON.stringify({ id: denied, sessionId: pageSession, method: "Runtime.evaluate" }));
+		const evaluate = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ id: evaluate, sessionId: pageSession, method: "Runtime.evaluate" }));
+		expect(ext.pending("send")[0]).toMatchObject({ tabId: 1, method: "Runtime.evaluate" });
+		ack(bridge, ext, "send");
 		await flush();
-		expect(cdp.messages.find(message => message.id === denied)?.error).toBeDefined();
-		expect(ext.rpcs("send")).toEqual([]);
+		expect(cdp.messages.find(message => message.id === evaluate)?.result).toEqual({});
 	});
 
 	it("retries auto-attach when a discarded tab revives before its cancelled attach settles", async () => {

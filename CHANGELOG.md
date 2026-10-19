@@ -4,6 +4,31 @@
 
 ### Breaking Changes
 
+- Changed the private extension/service protocol to version 3 and the package/extension version to 0.2.0; update both sides together.
+- Replaced reserved-page input isolation and focus-based pause with visible business tabs and shared workspace control.
+- Tabs moved into the workspace become controllable; moving them out revokes access.
+
+### Added
+
+- Added a portable, opt-in `install-skill` command documenting existing stock omp drag/mouse APIs.
+- Added `/capabilities` and `/docs`, with the same canonical reference packaged for the installed skill.
+- Added shared-control, migration, cancellation, native-view and last-business-tab lifecycle regressions.
+
+### Fixed
+
+- Preserved a successful last-tab close acknowledgement when its own window-removal event arrives first.
+- New-page provisioning now survives a closed last-tab window and delayed removal notifications while old page commands are cancelled.
+- Prevented a late move-in lookup from re-advertising a tab after it has moved out again.
+
+### Native Focus Policy
+
+- Real-page shared control explicitly permits Chrome to activate the workspace during mouse input; typing or scrolling in another window may be interrupted. `/capabilities`, the skill and settings page disclose that this is target authorization, not background native-focus isolation.
+
+## [0.1.0]
+
+
+### Breaking Changes
+
 - Extracted the extension and CDP server into the independent `omp-browser-relay` project; use its standalone serve/install commands with a matching extension.
 - Agent targets are restricted to a dedicated workspace window; legacy user-tab adoption and title-based tab grouping are removed.
 

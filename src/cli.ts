@@ -7,22 +7,29 @@ import { startRelayServer } from "./server";
 
 const HELP = `Usage: omp-browser-relay [serve] [--port <port>] [--token <secret>] [--verbose]
        omp-browser-relay install [--dir <directory>]
+       omp-browser-relay install-skill [--dir <directory>]
        omp-browser-relay --help | --version
 
 Commands:
-  serve       Listen on loopback for the Chrome extension and CDP clients (default)
-  install     Copy the built Chrome extension for loading as an unpacked extension
+  serve          Listen on loopback for the Chrome extension and CDP clients (default)
+  install        Copy the built Chrome extension for loading as an unpacked extension
+  install-skill  Copy the agent skill and canonical relay reference (opt-in)
+
+Discovery:
+  GET /capabilities  Machine-readable support, readiness and policy
+  GET /docs          Canonical browser API usage reference
 
 Options:
   -p, --port  Listening port (default: 9224; 0 chooses an available port)
   --token     Require this shared secret on the extension WebSocket endpoint
   --verbose   Log relay activity
-  --dir       Install directory (default: ~/.omp-browser-relay/extension)
+  --dir       Install destination (extension: ~/.omp-browser-relay/extension;
+              skill: ~/.agents/skills/omp-browser-relay)
   -h, --help  Show this help
   --version   Show the package version`;
 
 interface CliOptions {
-	action: "serve" | "install";
+	action: "serve" | "install" | "install-skill";
 	port: number;
 	token?: string;
 	verbose: boolean;
@@ -34,7 +41,9 @@ interface CliOptions {
 function parseArgs(argv: string[]): CliOptions {
 	const options: CliOptions = { action: "serve", port: 9224, verbose: false, help: false, showVersion: false };
 	const args = [...argv];
-	if (args[0] === "serve" || args[0] === "install") options.action = args.shift() as "serve" | "install";
+	if (args[0] === "serve" || args[0] === "install" || args[0] === "install-skill") {
+		options.action = args.shift() as CliOptions["action"];
+	}
 	let portProvided = false;
 	while (args.length > 0) {
 		const argument = args.shift()!;
@@ -59,8 +68,10 @@ function parseArgs(argv: string[]): CliOptions {
 		else if (flag === "--version") options.showVersion = true;
 		else throw new Error(`Unknown argument: ${argument}`);
 	}
-	if (options.action === "serve" && options.dir !== undefined) throw new Error("--dir is only valid for install");
-	if (options.action === "install" && (portProvided || options.token !== undefined || options.verbose)) {
+	if (options.action === "serve" && options.dir !== undefined) {
+		throw new Error("--dir is only valid for install or install-skill");
+	}
+	if (options.action !== "serve" && (portProvided || options.token !== undefined || options.verbose)) {
 		throw new Error("--port, --token and --verbose are only valid for serve");
 	}
 	return options;
@@ -74,6 +85,33 @@ async function main(): Promise<void> {
 	}
 	if (options.showVersion) {
 		console.log(version);
+		return;
+	}
+	if (options.action === "install-skill") {
+		let source = path.join(import.meta.dir, "skills", "omp-browser-relay");
+		if (!(await Bun.file(path.join(source, "SKILL.md")).exists())) {
+			source = path.resolve(import.meta.dir, "..", "skills", "omp-browser-relay");
+		}
+		if (
+			!(await Bun.file(path.join(source, "SKILL.md")).exists()) ||
+			!(await Bun.file(path.join(source, "reference.md")).exists())
+		) {
+			throw new Error("Packaged skill is missing; reinstall the package or run bun run build");
+		}
+		const destination = path.resolve(
+			options.dir ?? path.join(os.homedir(), ".agents", "skills", "omp-browser-relay"),
+		);
+		if (
+			destination === source ||
+			source.startsWith(`${destination}${path.sep}`) ||
+			destination.startsWith(`${source}${path.sep}`)
+		) {
+			throw new Error("Install directory must be separate from the packaged skill directory");
+		}
+		await fs.mkdir(destination, { recursive: true });
+		await fs.cp(source, destination, { recursive: true, force: true });
+		console.log(`Browser relay skill installed to ${destination}`);
+		console.log("Read SKILL.md and reference.md; use the relay URL configured in browser.relayUrl.");
 		return;
 	}
 	if (options.action === "install") {
@@ -100,7 +138,10 @@ async function main(): Promise<void> {
 		token: options.token,
 		log: options.verbose ? (message, data) => console.error(`[relay] ${message}`, data ?? "") : undefined,
 	});
-	console.log(`browser relay listening on http://127.0.0.1:${relay.port}`);
+	const baseUrl = `http://127.0.0.1:${relay.port}`;
+	console.log(`browser relay listening on ${baseUrl}`);
+	console.log(`Capabilities: ${baseUrl}/capabilities`);
+	console.log(`API reference: ${baseUrl}/docs`);
 	console.log(`Extension endpoint: ws://127.0.0.1:${relay.port}/ext${options.token ? "?token=***" : ""}`);
 	const stop = (): void => {
 		relay.stop();

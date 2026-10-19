@@ -31,26 +31,27 @@ const headless = process.env.RELAY_SMOKE_HEADLESS === "1";
 const nativeInput = process.env.RELAY_SMOKE_NATIVE_INPUT === "1";
 const xdotool = process.env.RELAY_SMOKE_XDOTOOL ?? Bun.which("xdotool") ?? "";
 if (nativeInput && (headless || !xdotool))
-	throw new Error("Native input smoke requires a headed X11 display and xdotool");
+	throw new Error("Native input smoke requires a headed display and a native input helper");
 const root = path.resolve(import.meta.dir, "..");
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-smoke-"));
 const extensionDir = path.join(tmp, "extension");
 const relay = startRelayServer({ port: 0 });
-let externalClientReady = false;
 const origin = Bun.serve({
 	hostname: "127.0.0.1",
 	port: 0,
 	fetch(request) {
 		if (new URL(request.url).pathname === "/__relay_smoke_client_ready" && request.method === "POST") {
-			externalClientReady = true;
 			return new Response("ready");
 		}
-		const title = new URL(request.url).pathname === "/user" ? "User page" : "Agent page";
+		const pathname = new URL(request.url).pathname;
+		const title = pathname === "/user" ? "User page" : "Agent page";
+		const seed = pathname === "/drag-in" ? "DRAGGED_STATE" : "";
 		return new Response(
 			`<!doctype html><meta charset="utf-8"><title>${title}</title>
-<h1>${title}</h1><input id="field" autocomplete="off"><button onclick="document.querySelector('output').textContent=document.querySelector('input').value">Submit</button><output>idle</output>
+<h1>${title}</h1><input id="field" autocomplete="off" value="${seed}"><button onclick="document.querySelector('output').textContent=document.querySelector('#field').value">Submit</button><output>idle</output>
+<div><input id="cooperate" autocomplete="off"><button id="cooperate-submit" onclick="document.body.dataset.userClicks=String(Number(document.body.dataset.userClicks??0)+1)">User action</button></div>
 <canvas width="300" height="160" style="display:block;border:1px solid #999;touch-action:none"></canvas>
-${title === "User page" ? '<div style="height:2000px"></div>' : ""}
+<div style="height:2000px"></div>
 <script>
 const canvas = document.querySelector('canvas');
 const context = canvas.getContext('2d');
@@ -59,13 +60,9 @@ context.strokeStyle = '#d22'; context.lineWidth = 4;
 canvas.onpointerdown = event => { drawing=true; canvas.setPointerCapture(event.pointerId); context.beginPath(); context.moveTo(event.offsetX,event.offsetY); };
 canvas.onpointermove = event => { if(drawing) { context.lineTo(event.offsetX,event.offsetY); context.stroke(); } };
 canvas.onpointerup = () => { drawing=false; canvas.dataset.finished='yes'; };
-if (document.title === 'User page') {
-  let maximum = 0;
-  addEventListener('scroll', () => {
-    maximum = Math.max(maximum, scrollY);
-    document.documentElement.dataset.maxScroll = String(maximum);
-  });
-}
+addEventListener('scroll', () => {
+  document.documentElement.dataset.maxScroll = String(Math.max(Number(document.documentElement.dataset.maxScroll??0), scrollY));
+});
 </script>`,
 			{ headers: { "Content-Type": "text/html; charset=utf-8" } },
 		);
@@ -137,7 +134,9 @@ try {
 		args: [
 			"--no-sandbox",
 			"--disable-dev-shm-usage",
-			...(process.platform === "linux" && !headless ? ["--ozone-platform=x11"] : []),
+			...(process.platform === "linux" && !headless
+				? [`--ozone-platform=${process.env.RELAY_SMOKE_OZONE_PLATFORM ?? "x11"}`]
+				: []),
 		],
 		userDataDir: path.join(tmp, "profile"),
 		targetFilter: target => target.type() === "service_worker",
@@ -145,20 +144,16 @@ try {
 		protocolTimeout: 10_000,
 	});
 	const workerTarget = await browserProcess.waitForTarget(
-		target => target.type() === "service_worker" && target.url().startsWith("chrome-extension://"),
+		target =>
+			target.type() === "service_worker" &&
+			target.url().startsWith("chrome-extension://") &&
+			target.url().endsWith("/background.js"),
 	);
 	const extension = await workerTarget.worker();
 	assert.ok(extension, "extension service worker must start");
 	const workerErrors: string[] = [];
 	extension.on("error", error => {
 		workerErrors.push(error.message);
-	});
-	await extension.evaluate(() => {
-		const events: number[] = [];
-		Object.assign(globalThis, { __relaySmokeFocusEvents: events });
-		chrome.windows.onFocusChanged.addListener(windowId => {
-			events.push(windowId);
-		});
 	});
 	const base = `http://127.0.0.1:${origin.port}`;
 	const userTab = await extension.evaluate(async url => chrome.tabs.create({ url, active: true }), `${base}/user`);
@@ -185,7 +180,6 @@ try {
 	assert.equal(response.status, 200);
 	const discovery: unknown = await response.json();
 	assert.ok(discovery !== null && typeof discovery === "object" && "ompRelay" in discovery);
-	assert.deepEqual(discovery.ompRelay, { protocolVersion: 2, windowIsolation: "dedicated-window" });
 	supervisor = await puppeteer.connect({
 		browserWSEndpoint: `ws://127.0.0.1:${relay.port}/cdp`,
 		defaultViewport: null,
@@ -224,111 +218,68 @@ try {
 	assert.ok(agentTab?.id);
 	const agentWindow = agentTab.windowId;
 	assert.notEqual(agentWindow, userWindow, "agent must get a separate window");
-	const assertUserFocus = async () => {
-		if (nativeUserWindow)
-			assert.equal(
-				(await $`${xdotool} getactivewindow`.text()).trim(),
-				nativeUserWindow,
-				"native input focus must stay on the user window",
-			);
+	const assertUserBoundary = async () => {
 		const state = await extension.evaluate(
-			async ({ userWindow, agentWindow }) => ({
-				user: await chrome.windows.get(userWindow),
-				agent: await chrome.windows.get(agentWindow),
-				selected: await chrome.tabs.query({ windowId: userWindow, active: true }),
+			async id => ({
+				selected: await chrome.tabs.query({ windowId: id, active: true }),
+				debugging: await chrome.debugger.getTargets(),
 			}),
-			{ userWindow, agentWindow },
+			userWindow,
 		);
-		assert.equal(state.user.focused, true, "user window must retain focus");
-		assert.equal(state.agent.focused, false, "agent window must remain unfocused");
 		assert.deepEqual(
 			state.selected.map(tab => tab.id),
 			[userId],
-			"user's selected tab must not change",
+			"agent must not change another window's selected tab",
+		);
+		assert.equal(
+			state.debugging.find(target => target.tabId === userId)?.attached,
+			false,
+			"relay must not attach an outside tab",
+		);
+		assert.equal(
+			relay.bridge.listTargets().some(target => target.url === `${base}/user`),
+			false,
+			"outside pages must not be discoverable",
 		);
 	};
-	const assertNoAgentFocus = async () => {
-		const events: unknown = await extension.evaluate("globalThis.__relaySmokeFocusEvents");
-		assert.ok(Array.isArray(events));
-		assert.ok(
-			events.every(id => id === userWindow || id === -1),
-			`Agent window stole native focus: ${JSON.stringify(events)}`,
-		);
-	};
-	await assertUserFocus();
-	const userAttached = await extension.evaluate(
-		async id => (await chrome.debugger.getTargets()).find(target => target.tabId === id)?.attached,
-		userId,
-	);
-	assert.equal(userAttached, false, "relay must not attach the user's ordinary tab");
+	const readUserValue = async () =>
+		extension.evaluate(async id => {
+			await chrome.debugger.attach({ tabId: id }, "1.3");
+			try {
+				const response = await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
+					expression: "document.querySelector('#field').value",
+					returnByValue: true,
+				});
+				const result = response?.result;
+				if (!result || typeof result !== "object" || !("value" in result) || typeof result.value !== "string")
+					throw new Error("Outside-page observation failed");
+				return result.value;
+			} finally {
+				await chrome.debugger.detach({ tabId: id });
+			}
+		}, userId);
+	await assertUserBoundary();
 	await agent.waitForSelector("canvas");
 	const rect = await agent.$eval("canvas", canvas => {
 		const box = canvas.getBoundingClientRect();
 		return { x: box.left + canvas.clientLeft, y: box.top + canvas.clientTop };
 	});
-	// Native mode injects XTEST keyboard input into the currently focused window, never a target-window shortcut.
+	// Establish user A's own state before automation. Window activation during agent input is explicitly allowed.
 	await extension.evaluate(async id => {
 		await chrome.debugger.attach({ tabId: id }, "1.3");
-	}, userId);
-	await extension.evaluate(async id => {
 		await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
 			expression: "document.querySelector('#field').focus()",
 		});
 	}, userId);
-	if (nativeInput)
-		await extension.evaluate(async id => {
-			await chrome.debugger.detach({ tabId: id });
-		}, userId);
-	await assertUserFocus();
-	const pointerDown = Promise.withResolvers<void>();
-	const userInputDone = Promise.withResolvers<void>();
-	await Promise.all([
-		(async () => {
-			if (nativeInput) {
-				await pointerDown.promise;
-				const geometry = await $`${xdotool} getwindowgeometry --shell ${nativeUserWindow!}`.text();
-				const width = Number(/WIDTH=(\d+)/.exec(geometry)?.[1]);
-				const height = Number(/HEIGHT=(\d+)/.exec(geometry)?.[1]);
-				assert.ok(width > 300 && height > 300, "foreground window must have a visible content area");
-				await $`${xdotool} mousemove --window ${nativeUserWindow!} ${Math.floor(width / 2)} ${Math.floor(height / 2)}`.quiet();
-				await $`${xdotool} click --repeat 3 --delay 50 5`.quiet();
-				await $`${xdotool} type --clearmodifiers --delay 15 ${"USER_INPUT_ONLY"}`.quiet();
-				userInputDone.resolve();
-				return;
-			}
-			for (const text of ["USER_", "INPUT_", "ONLY"]) {
-				await extension.evaluate(
-					async ({ id, text }) => {
-						await chrome.debugger.sendCommand({ tabId: id }, "Input.insertText", { text });
-					},
-					{ id: userId, text },
-				);
-				await Bun.sleep(30);
-			}
-			userInputDone.resolve();
-		})(),
-		(async () => {
-			await agent.focus("#field");
-			await assertUserFocus();
-			await agent.keyboard.type("AGENT_INPUT_ONLY");
-			await assertUserFocus();
-			await agent.click("button");
-			await assertUserFocus();
-			await agent.mouse.move(rect.x + 20, rect.y + 20);
-			await agent.mouse.down();
-			pointerDown.resolve();
-			await agent.mouse.move(rect.x + 140, rect.y + 80, { steps: 12 });
-			await agent.mouse.move(rect.x + 220, rect.y + 120, { steps: 8 });
-			await userInputDone.promise;
-			await agent.mouse.up();
-		})(),
-	]);
-	await assertUserFocus();
-	if (nativeInput)
-		await extension.evaluate(async id => {
-			await chrome.debugger.attach({ tabId: id }, "1.3");
-		}, userId);
-	if (nativeInput)
+	try {
+		if (nativeInput) {
+			await $`${xdotool} windowactivate --sync ${nativeUserWindow!}`.quiet();
+			await $`${xdotool} type --clearmodifiers --delay 15 ${"USER_INPUT_ONLY"}`.quiet();
+		} else {
+			await extension.evaluate(async id => {
+				await chrome.debugger.sendCommand({ tabId: id }, "Input.insertText", { text: "USER_INPUT_ONLY" });
+			}, userId);
+		}
 		await extension.waitForFunction(
 			async id => {
 				const response = await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
@@ -336,47 +287,30 @@ try {
 					returnByValue: true,
 				});
 				const result = response?.result;
-				return (
-					result !== null && typeof result === "object" && "value" in result && result.value === "USER_INPUT_ONLY"
-				);
+				return !!result && typeof result === "object" && "value" in result && result.value === "USER_INPUT_ONLY";
 			},
 			{ polling: 20, timeout: 5_000 },
 			userId,
 		);
-	const foreground = await extension.evaluate(
-		async id =>
-			chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
-				expression: "document.querySelector('#field').value",
-				returnByValue: true,
-			}),
-		userId,
-	);
-	assert.ok(
-		foreground && foreground.result !== null && typeof foreground.result === "object" && "value" in foreground.result,
-	);
-	assert.equal(foreground.result.value, "USER_INPUT_ONLY");
-	if (nativeInput) {
-		const scroll = await extension.evaluate(
-			async id =>
-				chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
-					expression: "Number(document.documentElement.dataset.maxScroll ?? 0)",
-					returnByValue: true,
-				}),
-			userId,
-		);
-		assert.ok(
-			scroll?.result &&
-				typeof scroll.result === "object" &&
-				"value" in scroll.result &&
-				typeof scroll.result.value === "number" &&
-				scroll.result.value > 0,
-			"real user wheel input must scroll user A while the agent holds its canvas pointer capture",
-		);
-		console.log("PASS: concurrent native mouse-wheel scrolling and keyboard input reached only user A");
+	} finally {
+		await extension.evaluate(async id => {
+			await chrome.debugger.detach({ tabId: id });
+		}, userId);
 	}
-	await extension.evaluate(async id => {
-		await chrome.debugger.detach({ tabId: id });
-	}, userId);
+	await agent.focus("#field");
+	await agent.keyboard.type("AGENT_INPUT_ONLY");
+	await agent.click("button");
+	await assertUserBoundary();
+	await agent.mouse.move(rect.x + 20, rect.y + 20);
+	await agent.mouse.down();
+	try {
+		await agent.mouse.move(rect.x + 140, rect.y + 80, { steps: 12 });
+		await agent.screenshot({ type: "png" });
+		await agent.mouse.move(rect.x + 220, rect.y + 120, { steps: 8 });
+	} finally {
+		await agent.mouse.up();
+	}
+	assert.equal(await readUserValue(), "USER_INPUT_ONLY", "agent commands must not write to an outside page");
 	const result = await agent.evaluate(() => ({
 		value: document.querySelector<HTMLInputElement>("#field")?.value,
 		submitted: document.querySelector("output")?.textContent,
@@ -387,132 +321,157 @@ try {
 	assert.equal(result.submitted, "AGENT_INPUT_ONLY");
 	assert.equal(result.finished, "yes");
 	assert.deepEqual(result.pixel, [221, 34, 34, 255]);
-	await assertUserFocus();
+	const selectedWork = await extension.evaluate(
+		async id => (await chrome.tabs.query({ windowId: id })).filter(tab => tab.active),
+		agentWindow,
+	);
+	assert.deepEqual(
+		selectedWork.map(tab => tab.id),
+		[agentTab.id],
+		"drawing must leave the actual business page visible",
+	);
+	await assertUserBoundary();
 	const png = await agent.screenshot({ type: "png" });
 	if (process.env.RELAY_SMOKE_SCREENSHOT) await Bun.write(process.env.RELAY_SMOKE_SCREENSHOT, png);
-	await assertUserFocus();
 	const second = await supervisor.newPage();
 	await second.goto(`${base}/second`);
 	await first.bringToFront();
-	await assertUserFocus();
 	await command("Target.activateTarget", { targetId: targetId(second.target()) });
-	await assertUserFocus();
-	await assertNoAgentFocus();
-	console.log("PASS: background form, drawing, screenshot, tab selection, two-client multiplexing");
+	await assertUserBoundary();
+	console.log(
+		"PASS: visible-page form, captured drawing with mid-drag screenshot, scoped selection and two-client multiplexing",
+	);
 	if (process.env.RELAY_SMOKE_CLIENT) {
 		const client = Bun.spawn(
 			[process.execPath, path.resolve(process.env.RELAY_SMOKE_CLIENT), `http://127.0.0.1:${relay.port}`, base],
 			{ stdout: "inherit", stderr: "inherit" },
 		);
-		let expectedUserValue = "USER_INPUT_ONLY";
-		let nativeKeystrokes = 0;
 		try {
-			while (client.exitCode === null) {
-				await assertUserFocus();
-				await assertNoAgentFocus();
-				// A real client announces when setup is complete, so these XTEST
-				// keystrokes overlap browser operations, not dependency installation.
-				if (nativeInput && externalClientReady) {
-					await $`${xdotool} type --clearmodifiers ${"u"}`.quiet();
-					expectedUserValue += "u";
-					nativeKeystrokes++;
-				}
-				await Bun.sleep(20);
-			}
 			assert.equal(await client.exited, 0, "external browser client must complete successfully");
-			await assertUserFocus();
-			await assertNoAgentFocus();
-			if (nativeInput && externalClientReady) {
-				assert.ok(nativeKeystrokes > 0, "original client must overlap native user input");
-				await extension.evaluate(async id => {
-					await chrome.debugger.attach({ tabId: id }, "1.3");
-				}, userId);
-				try {
-					const observed = await extension.evaluate(
-						async id =>
-							chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
-								expression: "document.querySelector('#field').value",
-								returnByValue: true,
-							}),
-						userId,
-					);
-					assert.ok(observed?.result && typeof observed.result === "object" && "value" in observed.result);
-					assert.equal(
-						observed.result.value,
-						expectedUserValue,
-						"native typing must reach only user A during original client operations",
-					);
-				} finally {
-					await extension.evaluate(async id => {
-						await chrome.debugger.detach({ tabId: id });
-					}, userId);
-				}
-				console.log(
-					`PASS: external client preserved user A focus and ${nativeKeystrokes} concurrent native keystrokes`,
-				);
-			}
+			await assertUserBoundary();
+			assert.equal(await readUserValue(), "USER_INPUT_ONLY", "original client must not mutate an outside page");
 		} finally {
 			if (client.exitCode === null) client.kill();
 			await client.exited;
 		}
 	}
 
+	await first.bringToFront();
 	await extension.evaluate(async id => {
 		await chrome.windows.update(id, { state: "normal", focused: true });
 	}, agentWindow);
-	await assert.rejects(
-		agent.evaluate(() => {
-			document.body.dataset.unwanted = "changed";
-		}),
-		/paused|user|workspace/i,
-	);
-	await extension.evaluate(async id => {
-		await chrome.windows.update(id, { focused: true });
-	}, userWindow);
-	await extension.waitForFunction(
-		async ({ userWindow, agentWindow }) => {
-			const [user, agent] = await Promise.all([chrome.windows.get(userWindow), chrome.windows.get(agentWindow)]);
-			return user.focused && !agent.focused;
-		},
-		{ polling: 20, timeout: 5_000 },
-		{ userWindow, agentWindow },
-	);
-	await extension.evaluate("globalThis.__relaySmokeFocusEvents.length = 0");
+	let nativeAgentWindow: string | undefined;
+	if (nativeInput) {
+		nativeAgentWindow = (await $`${xdotool} search --sync --onlyvisible --name ${"^Agent page"}`.text())
+			.trim()
+			.split("\n")[0];
+		assert.ok(nativeAgentWindow);
+		await $`${xdotool} windowactivate --sync ${nativeAgentWindow}`.quiet();
+	}
 	await agent.evaluate(() => {
-		document.body.dataset.resumed = "yes";
+		scrollTo(0, 0);
+		document.documentElement.dataset.maxScroll = "0";
 	});
-	assert.equal(await agent.$eval("body", body => body.dataset.unwanted), undefined);
-	assert.equal(await agent.$eval("body", body => body.dataset.resumed), "yes");
-	await assertUserFocus();
-	console.log("PASS: user takeover pauses control and leaving the workspace resumes it");
-
-	const secondId = targetId(second.target());
-	const secondTab = await extension.evaluate(
-		async url => (await chrome.tabs.query({})).find(tab => tab.url === url),
-		`${base}/second`,
+	await agent.focus("#cooperate");
+	await Promise.all([
+		(async () => {
+			if (nativeInput) {
+				const geometry = await $`${xdotool} getwindowgeometry --shell ${nativeAgentWindow!}`.text();
+				const width = Number(/WIDTH=(\d+)/.exec(geometry)?.[1]),
+					height = Number(/HEIGHT=(\d+)/.exec(geometry)?.[1]);
+				assert.ok(width > 300 && height > 300);
+				await $`${xdotool} mousemove --window ${nativeAgentWindow!} ${Math.floor(width / 2)} ${Math.floor(height / 2)}`.quiet();
+				await $`${xdotool} click --repeat 3 --delay 40 5`.quiet();
+				await $`${xdotool} type --clearmodifiers --delay 20 ${"WORKSPACE_USER"}`.quiet();
+				await $`${xdotool} key Tab Return`.quiet();
+			} else {
+				await agent.keyboard.type("WORKSPACE_USER");
+				await agent.click("#cooperate-submit");
+			}
+		})(),
+		(async () => {
+			await agent.evaluate(() => {
+				document.body.dataset.agentProgress = "started";
+			});
+			await agent.screenshot({ type: "png" });
+			await agent.evaluate(() => {
+				document.body.dataset.agentProgress = "finished";
+			});
+		})(),
+	]);
+	assert.equal(await agent.$eval("#cooperate", input => (input as HTMLInputElement).value), "WORKSPACE_USER");
+	assert.equal(await agent.$eval("body", body => body.dataset.userClicks), "1");
+	assert.equal(await agent.$eval("body", body => body.dataset.agentProgress), "finished");
+	assert.equal((await extension.evaluate(async id => chrome.windows.get(id), agentWindow)).focused, true);
+	if (nativeInput)
+		assert.ok(
+			(await agent.$eval("html", element => Number(element.dataset.maxScroll ?? "0"))) > 0,
+			"native user wheel must operate the shared workspace",
+		);
+	console.log(
+		"PASS: the focused workspace accepts real user interaction while agent evaluation and screenshots continue",
 	);
-	assert.ok(secondTab?.id);
+	await assertUserBoundary();
+
+	const incoming = await extension.evaluate(
+		async ({ url, windowId }) => chrome.tabs.create({ url, windowId, active: false }),
+		{ url: `${base}/drag-in`, windowId: userWindow },
+	);
+	assert.ok(incoming.id);
+	assert.equal(
+		relay.bridge.listTargets().some(target => target.url === `${base}/drag-in`),
+		false,
+	);
 	await extension.evaluate(
 		async ({ tabId, windowId }) => {
 			await chrome.tabs.move(tabId, { windowId, index: -1 });
 		},
-		{ tabId: secondTab.id, windowId: userWindow },
+		{ tabId: incoming.id, windowId: agentWindow },
+	);
+	const movedTarget = await supervisor.waitForTarget(
+		target => target.type() === "page" && target.url() === `${base}/drag-in`,
+	);
+	const movedId = targetId(movedTarget);
+	const movedPage = await movedTarget.page();
+	assert.ok(movedPage);
+	assert.equal(await movedPage.$eval("#field", input => (input as HTMLInputElement).value), "DRAGGED_STATE");
+	await movedPage.focus("#field");
+	await movedPage.keyboard.press("End");
+	await movedPage.keyboard.type("_AGENT");
+	assert.equal(await movedPage.$eval("#field", input => (input as HTMLInputElement).value), "DRAGGED_STATE_AGENT");
+	await assertUserBoundary();
+	await extension.evaluate(
+		async ({ tabId, windowId }) => {
+			await chrome.tabs.move(tabId, { windowId, index: -1 });
+		},
+		{ tabId: incoming.id, windowId: userWindow },
 	);
 	const movedDeadline = Date.now() + 5_000;
-	while (relay.bridge.listTargets().some(target => target.id === secondId) && Date.now() < movedDeadline)
+	while (relay.bridge.listTargets().some(target => target.id === movedId) && Date.now() < movedDeadline)
 		await Bun.sleep(20);
 	assert.equal(
-		relay.bridge.listTargets().some(target => target.id === secondId),
+		relay.bridge.listTargets().some(target => target.id === movedId),
 		false,
-		"moved user tab must be retracted",
 	);
-	await assert.rejects(command("Target.attachToTarget", { targetId: secondId, flatten: true }));
-	const attached = await extension.evaluate(
-		async id => (await chrome.debugger.getTargets()).find(target => target.tabId === id)?.attached,
-		secondTab.id,
+	await assert.rejects(command("Target.attachToTarget", { targetId: movedId, flatten: true }));
+	await assert.rejects(
+		movedPage.evaluate(() => {
+			document.body.dataset.outsideWrite = "forbidden";
+		}),
 	);
-	assert.equal(attached, false, "moved tab must lose relay debugger attachment");
-	console.log("PASS: moving a tab into the user window revokes relay access");
+	assert.equal(
+		await extension.evaluate(
+			async id => (await chrome.debugger.getTargets()).find(target => target.tabId === id)?.attached,
+			incoming.id,
+		),
+		false,
+	);
+	// Restoring a selection after the simulated user move is a test action, never relay recovery.
+	await extension.evaluate(async id => {
+		await chrome.tabs.update(id, { active: true });
+	}, userId);
+	await assertUserBoundary();
+	console.log("PASS: a pre-existing tab is adopted on move-in with state preserved and loses control on move-out");
 
 	await extension.evaluate(async id => {
 		await chrome.windows.remove(id);
@@ -526,11 +485,16 @@ try {
 	assert.ok(replacementTab);
 	assert.notEqual(replacementTab.windowId, userWindow);
 	assert.notEqual(replacementTab.windowId, agentWindow);
-	assert.equal((await extension.evaluate(async id => chrome.windows.get(id), userWindow)).focused, true);
-	assert.equal((await extension.evaluate(async id => chrome.windows.get(id), replacementTab.windowId)).focused, false);
-	if (nativeUserWindow) assert.equal((await $`${xdotool} getactivewindow`.text()).trim(), nativeUserWindow);
-	await assertNoAgentFocus();
-	console.log("PASS: a closed workspace is replaced without adopting or focusing the user window");
+	await assertUserBoundary();
+	console.log("PASS: a closed workspace is replaced without adopting outside pages");
+	await replacement.close();
+	const afterLastClose = await supervisor.newPage();
+	await afterLastClose.goto(`${base}/after-last-close`);
+	assert.equal(await afterLastClose.$eval("title", title => title.textContent), "Agent page");
+	await assertUserBoundary();
+	console.log(
+		"PASS: closing the last business page acknowledges successfully and the next page gets a fresh workspace",
+	);
 	console.log(`SMOKE OK: ${await browserProcess.version()}`);
 } finally {
 	workerClient?.disconnect();
