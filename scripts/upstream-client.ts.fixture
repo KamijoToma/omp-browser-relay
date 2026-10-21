@@ -23,6 +23,10 @@ interface Tab {
 	mouseUp(): Promise<void>;
 	drag(from: string | { x: number; y: number }, to: string | { x: number; y: number }): Promise<void>;
 	evaluate<Args extends unknown[], Result>(fn: (...args: Args) => Result, ...args: Args): Promise<Awaited<Result>>;
+	run<Result>(fn: (scope: {
+		tab: Tab;
+		page: { waitForFunction(fn: () => unknown, options: { timeout: number }): Promise<unknown> };
+	}) => Promise<Result>): Promise<Result>;
 	screenshot(options?: { selector?: string; format?: "png"; ifChanged?: boolean }): Promise<unknown>;
 	emulate(options: { viewport: { width: number; height: number; scale: number } }): Promise<unknown>;
 	recordStart(destination: string, options: { fps: number; quality: number }): Promise<unknown>;
@@ -103,10 +107,10 @@ async function mediaCommand(binary: "ffmpeg" | "ffprobe", args: string[]): Promi
 	assert.ok(executable, `Original recording acceptance requires system ${binary} on PATH`);
 	const child = Bun.spawn([executable, ...args], { stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr, code] = await Promise.all([
-		new Response(child.stdout).bytes(), new Response(child.stderr).text(), child.exited,
+		new Response(child.stdout).arrayBuffer(), new Response(child.stderr).text(), child.exited,
 	]);
 	assert.equal(code, 0, `${binary} failed while inspecting original recording: ${stderr}`);
-	return stdout;
+	return new Uint8Array(stdout);
 }
 async function animateRecording(tab: Tab, label: string): Promise<string> {
 	assert.equal(record(await tab.recording()).active, false);
@@ -166,6 +170,117 @@ async function inspectRecording(destination: string, stopped?: Record<string, un
 	assert.deepEqual([...seen].sort(), ["blue", "red"], "decoded video must contain both actual canvas color states");
 	console.log(`PASS original recording ${path.basename(destination)}: ${JSON.stringify({ codec: stream.codec_name, width: stream.width, height: stream.height, frames: Number(stream.nb_read_frames), duration: Number(metadata.format.duration), bytes: bytes.length, colors: [...seen].sort() })}`);
 }
+async function interactionContract(tab: Tab): Promise<void> {
+	const association = await tab.evaluate(() => {
+		const control = document.querySelector<HTMLInputElement>("#label-control")!;
+		return {
+			labels: [...control.labels!].map(label => ({ id: label.id, control: label.control?.id })),
+			pointerEvents: getComputedStyle(control).pointerEvents,
+			checked: control.checked,
+		};
+	});
+	assert.deepEqual(association, {
+		labels: [{ id: "associated-label", control: "label-control" }],
+		pointerEvents: "none",
+		checked: false,
+	});
+	await tab.run(async ({ tab, page }) => {
+		await tab.click("#associated-label");
+		await page.waitForFunction(() => document.querySelector<HTMLInputElement>("#label-control")?.checked === true, { timeout: 5_000 });
+	});
+	assert.deepEqual(await tab.evaluate(() => ({
+		checked: document.querySelector<HTMLInputElement>("#label-control")!.checked,
+		state: document.querySelector("#label-state")!.textContent,
+		changes: Number(document.querySelector("#label-count")!.textContent),
+	})), { checked: true, state: "Checked", changes: 1 });
+
+	const readRows = () => ["row-a", "row-b"].map(id => {
+		const row = document.getElementById(id)!;
+		const input = row.querySelector<HTMLInputElement>('input[name="alias"]')!;
+		return {
+			id,
+			unchanged: input.value === input.defaultValue,
+			state: row.querySelector("[data-save-state]")!.textContent,
+			saves: Number(row.querySelector("[data-save-count]")!.textContent),
+		};
+	});
+	assert.deepEqual(await tab.evaluate(readRows), [
+		{ id: "row-a", unchanged: true, state: "Unchanged", saves: 0 },
+		{ id: "row-b", unchanged: true, state: "Unchanged", saves: 0 },
+	]);
+	await tab.fill('#row-b input[name="alias"]', "row-b-only");
+	await tab.run(async ({ tab, page }) => {
+		await tab.click("#row-b button");
+		await page.waitForFunction(() =>
+			document.querySelector("#row-b [data-save-state]")?.textContent === "Saved" &&
+			document.querySelector("#row-b [data-save-count]")?.textContent === "1", { timeout: 5_000 });
+	});
+	assert.deepEqual(await tab.evaluate(readRows), [
+		{ id: "row-a", unchanged: true, state: "Unchanged", saves: 0 },
+		{ id: "row-b", unchanged: false, state: "Saved", saves: 1 },
+	], "scoped Save must commit only the target row, without changing its sibling");
+
+	const readSteps = () => ["one", "two", "three"].map(step => ({
+		step,
+		complete: document.querySelector(`#step-${step}`)!.getAttribute("aria-pressed") === "true",
+		count: Number(document.querySelector(`#step-${step}-count`)!.textContent),
+	}));
+	assert.deepEqual(await tab.evaluate(readSteps), [
+		{ step: "one", complete: false, count: 0 },
+		{ step: "two", complete: false, count: 0 },
+		{ step: "three", complete: false, count: 0 },
+	]);
+	// The missing third selector is a real later API failure. A run is not a
+	// transaction: its verified earlier page effects must survive the error.
+	const partial = await tab.run(async ({ tab, page }) => {
+		const completed: string[] = [];
+		let failedStep = "one";
+		try {
+			await tab.click("#step-one");
+			await page.waitForFunction(() => document.querySelector("#step-one")?.getAttribute("aria-pressed") === "true", { timeout: 5_000 });
+			completed.push("one");
+			failedStep = "two";
+			await tab.click("#step-two");
+			await page.waitForFunction(() => document.querySelector("#step-two")?.getAttribute("aria-pressed") === "true", { timeout: 5_000 });
+			completed.push("two");
+			failedStep = "three";
+			await tab.click("#missing-step");
+			await page.waitForFunction(() => document.querySelector("#step-three")?.getAttribute("aria-pressed") === "true", { timeout: 5_000 });
+			completed.push("three");
+			return { status: "complete", completed, uncertain: [], remaining: [], failedStep: null };
+		} catch (error) {
+			return {
+				status: "partial", completed, uncertain: [failedStep],
+				remaining: ["one", "two", "three"].slice(["one", "two", "three"].indexOf(failedStep) + 1),
+				failedStep,
+				diagnostic: {
+					name: typeof error === "object" && error !== null && "name" in error && typeof error.name === "string" ? error.name : null,
+					message: typeof error === "object" && error !== null && "message" in error && typeof error.message === "string" ? error.message : typeof error === "string" ? error : null,
+				},
+			};
+		}
+	});
+	assert.equal(partial.status, "partial");
+	assert.deepEqual(partial.completed, ["one", "two"]);
+	assert.deepEqual(partial.uncertain, ["three"]);
+	assert.deepEqual(partial.remaining, []);
+	assert.equal(partial.failedStep, "three");
+	// Re-observe before deciding what remains; never replay the whole run.
+	assert.deepEqual(await tab.evaluate(readSteps), [
+		{ step: "one", complete: true, count: 1 },
+		{ step: "two", complete: true, count: 1 },
+		{ step: "three", complete: false, count: 0 },
+	]);
+	await tab.run(async ({ tab, page }) => {
+		await tab.click("#step-three");
+		await page.waitForFunction(() => document.querySelector("#step-three")?.getAttribute("aria-pressed") === "true", { timeout: 5_000 });
+	});
+	assert.deepEqual(await tab.evaluate(readSteps), [
+		{ step: "one", complete: true, count: 1 },
+		{ step: "two", complete: true, count: 1 },
+		{ step: "three", complete: true, count: 1 },
+	], "resume must complete only the remaining step, not replay non-idempotent earlier steps");
+}
 try {
 	const ready = await fetch(`${origin}/__relay_smoke_client_ready`, { method: "POST", proxy: false });
 	assert.equal(await ready.text(), "ready", "native smoke must acknowledge the original client's operation phase");
@@ -178,6 +293,10 @@ try {
 	const reused = await browser.open({ url: `${origin}/upstream-main`, viewport: { width: 800, height: 600 } });
 	assert.equal(reused.name, "main");
 	assert.equal(await main.url(), `${origin}/upstream-main`);
+	// Keep this separate fixture out of the Canvas and outside-tab safety pages.
+	await browser.open({ url: `${origin}/interaction` });
+	await interactionContract(main);
+	await browser.open({ url: `${origin}/upstream-main`, viewport: { width: 800, height: 600 } });
 	await deterministicViewport(main);
 	const second = await browser.open({ name: "contract-second", url: `${origin}/upstream-second` });
 	const tabs = await browser.tabs();
@@ -307,6 +426,7 @@ try {
 	assert.equal(await borrowedAgain.value("#field"), "SECOND_TAB_ONLY", "reopening a borrowed target must preserve its real form state");
 	assert.equal(record(await borrowedAgain.recording()).active, false, "reopening a borrowed target must not retain the closed worker's recording");
 	console.log("PASS original SDK frontend: default open, URL target adoption, named tabs, fill/click/canvas, DPR-1 decoded screenshot/display, exact pixel diff, change revisions, decoded WebM recording stop + owned/borrowed close finalization, real errors");
+	console.log("PASS original npm 18.12.2 generic interactions: associated label, scoped Save + sibling isolation, delayed DOM confirmation, actual partial-run failure + observed resume without replay");
 	console.log("ENTRY LIMIT: original browser eval JavaScript facade + createBrowserPrelude SDK host; original CLI --version only, no LLM CLI flow");
 } finally {
 	await browser.close({ all: true });

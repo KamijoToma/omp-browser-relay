@@ -1369,10 +1369,11 @@ export class RelayBridge {
 				return true;
 			})
 			.catch(err => {
+				// Keep attach diagnostics allowlisted: URLs and extension errors can contain page secrets.
 				this.#log("attach failed", {
 					tabKey: tab.tabKey,
-					url: tab.url,
-					error: err instanceof Error ? err.message : String(err),
+					operation: "attach",
+					failure: err instanceof ExtensionReplacedError ? "extension_replaced" : "attachment_failed",
 				});
 				if (!(err instanceof ExtensionReplacedError) && this.#eligible(tab)) tab.banned = true;
 				return false;

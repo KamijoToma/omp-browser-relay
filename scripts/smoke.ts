@@ -44,6 +44,72 @@ const origin = Bun.serve({
 			return new Response("ready");
 		}
 		const pathname = new URL(request.url).pathname;
+		if (pathname === "/interaction") {
+			return new Response(
+				`<!doctype html><meta charset="utf-8"><title>Generic interaction page</title>
+<style>section{margin-block:16px}h2{font-size:1em}output{margin-inline:8px}</style>
+<h1>Generic interactions</h1>
+<section>
+  <input id="label-control" type="checkbox" style="pointer-events:none">
+  <label id="associated-label" for="label-control">Enable choice</label>
+  <output id="label-state">Unchecked</output>Changes: <output id="label-count">0</output>
+</section>
+<section id="row-a">
+  <h2>Record A</h2><label for="alias-a">Alias</label>
+  <input id="alias-a" name="alias" autocomplete="off" value="A-seed"><button type="button">Save</button>
+  <output data-save-state>Unchanged</output>Saves: <output data-save-count>0</output>
+</section>
+<section id="row-b">
+  <h2>Record B</h2><label for="alias-b">Alias</label>
+  <input id="alias-b" name="alias" autocomplete="off" value="B-seed"><button type="button">Save</button>
+  <output data-save-state>Unchanged</output>Saves: <output data-save-count>0</output>
+</section>
+<section>
+  <button id="step-one" type="button" aria-pressed="false">First step</button>
+  <output id="step-one-state">Pending</output>Invocations: <output id="step-one-count">0</output>
+</section>
+<section>
+  <button id="step-two" type="button" aria-pressed="false">Delayed second step</button>
+  <output id="step-two-state">Pending</output>Invocations: <output id="step-two-count">0</output>
+</section>
+<section>
+  <button id="step-three" type="button" aria-pressed="false">Third step</button>
+  <output id="step-three-state">Pending</output>Invocations: <output id="step-three-count">0</output>
+</section>
+<script>
+const control = document.querySelector('#label-control');
+control.addEventListener('change', () => {
+  document.querySelector('#label-state').textContent = control.checked ? 'Checked' : 'Unchecked';
+  const count = document.querySelector('#label-count');
+  count.textContent = String(Number(count.textContent) + 1);
+});
+for (const row of document.querySelectorAll('#row-a, #row-b')) {
+  const input = row.querySelector('input[name="alias"]');
+  let committedAlias = input.value;
+  row.querySelector('button').addEventListener('click', () => {
+    const count = row.querySelector('[data-save-count]');
+    count.textContent = String(Number(count.textContent) + 1);
+    row.querySelector('[data-save-state]').textContent = input.value !== committedAlias ? 'Saved' : 'Unchanged';
+    committedAlias = input.value;
+  });
+}
+for (const step of ['one', 'two', 'three']) {
+  const button = document.querySelector('#step-' + step);
+  button.addEventListener('click', () => {
+    const count = document.querySelector('#step-' + step + '-count');
+    count.textContent = String(Number(count.textContent) + 1);
+    const complete = () => {
+      button.setAttribute('aria-pressed', 'true');
+      document.querySelector('#step-' + step + '-state').textContent = 'Completed';
+    };
+    if (step === 'two') setTimeout(complete, 150);
+    else complete();
+  });
+}
+</script>`,
+				{ headers: { "Content-Type": "text/html; charset=utf-8" } },
+			);
+		}
 		const title = pathname === "/user" ? "User page" : "Agent page";
 		const seed = pathname === "/drag-in" ? "DRAGGED_STATE" : "";
 		return new Response(

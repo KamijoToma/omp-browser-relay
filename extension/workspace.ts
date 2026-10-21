@@ -56,7 +56,8 @@ export class Workspace {
 	#windowId: number | null = null;
 	#browserSession = "";
 	#known = new Set<number>();
-	#attached = new Set<number>();
+	#attached = new Map<number, number>();
+	#attachmentSequence = 0;
 	#attaching = new Map<number, Promise<void>>();
 	#detaching = new Map<number, Promise<void>>();
 	#children = new Map<number, Map<string, string>>();
@@ -158,7 +159,7 @@ export class Workspace {
 		const next = this.#storageOps.then(() =>
 			this.#api.storage.session.set({
 				[SESSION_KEY]: this.#windowId,
-				[ATTACHED_KEY]: [...this.#attached],
+				[ATTACHED_KEY]: [...this.#attached.keys()],
 				[BROWSER_SESSION_KEY]: this.#browserSession,
 			}),
 		);
@@ -347,7 +348,7 @@ export class Workspace {
 			const tab = await this.#authorize(view, tabId);
 			if (tab?.discarded) throw new Error("Cannot attach to a discarded workspace tab");
 			await this.#api.debugger.attach({ tabId }, "1.3");
-			this.#attached.add(tabId);
+			this.#attached.set(tabId, ++this.#attachmentSequence);
 			try {
 				const attached = await this.#authorize(view, tabId);
 				if (attached?.discarded) throw new Error("Chrome discarded the workspace tab while attaching");
@@ -396,7 +397,7 @@ export class Workspace {
 		this.#cancelViews();
 		await this.ready;
 		await Promise.allSettled(this.#attaching.values());
-		await Promise.all([...this.#attached].map(id => this.#detach(id).catch(() => {})));
+		await Promise.all([...this.#attached.keys()].map(id => this.#detach(id).catch(() => {})));
 	}
 
 	async #debuggerEvent(
@@ -405,12 +406,15 @@ export class Workspace {
 		params?: Record<string, unknown>,
 	): Promise<void> {
 		const tabId = source.tabId;
-		if (tabId === undefined || !this.#attached.has(tabId)) return;
+		if (tabId === undefined) return;
+		const generation = this.#attached.get(tabId);
+		if (generation === undefined) return;
 		try {
 			await this.#owned(tabId);
 		} catch {
 			return;
 		}
+		if (this.#attached.get(tabId) !== generation) return;
 		if (method === "Target.attachedToTarget" && typeof params?.sessionId === "string") {
 			const targetInfo = params.targetInfo;
 			if (
@@ -440,10 +444,14 @@ export class Workspace {
 		return target !== null && typeof target === "object" && "targetId" in target && target.targetId === targetId;
 	}
 
+	#checkChildSession(tabId: number, sessionId: unknown): void {
+		if (typeof sessionId !== "string" || !this.#children.get(tabId)?.has(sessionId))
+			throw new Error("Unknown workspace child session");
+	}
+
 	async #send(msg: Extract<RelayRpcRequest, { op: "send" }>, epoch: number, view?: ViewOperation): Promise<unknown> {
 		if (!this.#attached.has(msg.tabId)) throw new Error("Tab is not attached by this relay");
-		if (msg.sessionId && !this.#children.get(msg.tabId)?.has(msg.sessionId))
-			throw new Error("Unknown workspace child session");
+		if (msg.sessionId) this.#checkChildSession(msg.tabId, msg.sessionId);
 		if (epoch !== this.#epoch) throw new Error("Relay disconnected before command dispatch");
 		const { method, params } = msg;
 		if (method === "Emulation.setFocusEmulationEnabled") {
@@ -467,8 +475,7 @@ export class Workspace {
 				if (params?.targetId !== undefined && !(await this.#targetOwned(msg.tabId, params.targetId)))
 					throw new Error("Target is outside the workspace tab");
 			} else if (method === "Target.detachFromTarget") {
-				if (typeof params?.sessionId !== "string" || !this.#children.get(msg.tabId)?.has(params.sessionId))
-					throw new Error("Unknown workspace child session");
+				this.#checkChildSession(msg.tabId, params?.sessionId);
 			} else {
 				throw new Error(`Unsupported global target command: ${method}`);
 			}
@@ -480,6 +487,8 @@ export class Workspace {
 		if (epoch !== this.#epoch) throw new Error("Relay disconnected before command dispatch");
 		if (!this.#attached.has(msg.tabId)) throw new Error("Tab is not attached by this relay");
 		if (view) this.#check(view);
+		if (msg.sessionId) this.#checkChildSession(msg.tabId, msg.sessionId);
+		if (method === "Target.detachFromTarget") this.#checkChildSession(msg.tabId, params?.sessionId);
 		const command = this.#api.debugger.sendCommand(
 			msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId },
 			method,

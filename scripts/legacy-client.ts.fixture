@@ -113,6 +113,123 @@ try {
 		assert.deepEqual(named.map((tab: { name: string }) => tab.name).sort(), ["legacy-second", "main"]);
 		assert.equal(named.find((tab: { name: string }) => tab.name === "main")?.url, `${origin}/agent`);
 		assert.equal(named.find((tab: { name: string }) => tab.name === "legacy-second")?.url, `${origin}/second`);
+		// Reuse the borrowed main page for the independent fixture, then restore
+		// its original URL before all existing form, Canvas, and lifecycle checks.
+		await js(`await browser.open({ url: ${JSON.stringify(`${origin}/interaction`)} });`);
+		assert.equal(await js("return await main.url();"), `${origin}/interaction`);
+		const association = await js(`return await main.evaluate(() => {
+			const control = document.querySelector("#label-control");
+			return {
+				labels: [...control.labels].map(label => ({ id: label.id, control: label.control?.id })),
+				pointerEvents: getComputedStyle(control).pointerEvents,
+				checked: control.checked,
+			};
+		});`);
+		assert.deepEqual(association, {
+			labels: [{ id: "associated-label", control: "label-control" }],
+			pointerEvents: "none",
+			checked: false,
+		});
+		await js(`await main.run(async ({ tab, page }) => {
+			await tab.click("#associated-label");
+			await page.waitForFunction(() => document.querySelector("#label-control")?.checked === true, { timeout: 5000 });
+		});`);
+		assert.deepEqual(await js(`return await main.evaluate(() => ({
+			checked: document.querySelector("#label-control").checked,
+			state: document.querySelector("#label-state").textContent,
+			changes: Number(document.querySelector("#label-count").textContent),
+		}));`), { checked: true, state: "Checked", changes: 1 });
+
+		const readRows = `return await main.evaluate(() => ["row-a", "row-b"].map(id => {
+			const row = document.getElementById(id);
+			const input = row.querySelector('input[name="alias"]');
+			return {
+				id,
+				unchanged: input.value === input.defaultValue,
+				state: row.querySelector("[data-save-state]").textContent,
+				saves: Number(row.querySelector("[data-save-count]").textContent),
+			};
+		}));`;
+		assert.deepEqual(await js(readRows), [
+			{ id: "row-a", unchanged: true, state: "Unchanged", saves: 0 },
+			{ id: "row-b", unchanged: true, state: "Unchanged", saves: 0 },
+		]);
+		await js(`await main.fill('#row-b input[name="alias"]', "row-b-only");
+			await main.run(async ({ tab, page }) => {
+				await tab.click("#row-b button");
+				await page.waitForFunction(() =>
+					document.querySelector("#row-b [data-save-state]")?.textContent === "Saved" &&
+					document.querySelector("#row-b [data-save-count]")?.textContent === "1", { timeout: 5000 });
+			});`);
+		assert.deepEqual(await js(readRows), [
+			{ id: "row-a", unchanged: true, state: "Unchanged", saves: 0 },
+			{ id: "row-b", unchanged: false, state: "Saved", saves: 1 },
+		], "scoped Save must commit only the target row, without changing its sibling");
+
+		const readSteps = `return await main.evaluate(() => ["one", "two", "three"].map(step => ({
+			step,
+			complete: document.querySelector("#step-" + step).getAttribute("aria-pressed") === "true",
+			count: Number(document.querySelector("#step-" + step + "-count").textContent),
+		})));`;
+		assert.deepEqual(await js(readSteps), [
+			{ step: "one", complete: false, count: 0 },
+			{ step: "two", complete: false, count: 0 },
+			{ step: "three", complete: false, count: 0 },
+		]);
+		const partial = await js<{
+			status: string; completed: string[]; uncertain: string[]; remaining: string[]; failedStep: string | null;
+		}>(`return await main.run(async ({ tab, page }) => {
+			const completed = [];
+			let failedStep = "one";
+			try {
+				await tab.click("#step-one");
+				await page.waitForFunction(() => document.querySelector("#step-one")?.getAttribute("aria-pressed") === "true", { timeout: 5000 });
+				completed.push("one");
+				failedStep = "two";
+				await tab.click("#step-two");
+				await page.waitForFunction(() => document.querySelector("#step-two")?.getAttribute("aria-pressed") === "true", { timeout: 5000 });
+				completed.push("two");
+				failedStep = "three";
+				await tab.click("#missing-step");
+				await page.waitForFunction(() => document.querySelector("#step-three")?.getAttribute("aria-pressed") === "true", { timeout: 5000 });
+				completed.push("three");
+				return { status: "complete", completed, uncertain: [], remaining: [], failedStep: null };
+			} catch (error) {
+				return {
+					status: "partial", completed, uncertain: [failedStep],
+					remaining: ["one", "two", "three"].slice(["one", "two", "three"].indexOf(failedStep) + 1),
+					failedStep,
+					diagnostic: {
+						name: typeof error === "object" && error !== null && "name" in error && typeof error.name === "string" ? error.name : null,
+						message: typeof error === "object" && error !== null && "message" in error && typeof error.message === "string" ? error.message : typeof error === "string" ? error : null,
+					},
+				};
+			}
+		});`);
+		assert.equal(partial.status, "partial");
+		assert.deepEqual(partial.completed, ["one", "two"]);
+		assert.deepEqual(partial.uncertain, ["three"]);
+		assert.deepEqual(partial.remaining, []);
+		assert.equal(partial.failedStep, "three");
+		// A real failure does not roll back earlier page effects. Observe them
+		// before resuming only the step whose visible count is still zero.
+		assert.deepEqual(await js(readSteps), [
+			{ step: "one", complete: true, count: 1 },
+			{ step: "two", complete: true, count: 1 },
+			{ step: "three", complete: false, count: 0 },
+		]);
+		await js(`await main.run(async ({ tab, page }) => {
+			await tab.click("#step-three");
+			await page.waitForFunction(() => document.querySelector("#step-three")?.getAttribute("aria-pressed") === "true", { timeout: 5000 });
+		});`);
+		assert.deepEqual(await js(readSteps), [
+			{ step: "one", complete: true, count: 1 },
+			{ step: "two", complete: true, count: 1 },
+			{ step: "three", complete: true, count: 1 },
+		], "resume must complete only the remaining step, not replay non-idempotent earlier steps");
+		await js(`await browser.open({ url: ${JSON.stringify(`${origin}/agent`)} });`);
+		assert.equal(await js("return await main.url();"), `${origin}/agent`);
+		assert.deepEqual((await targets()).map(target => target.id).sort(), initial.map(target => target.id).sort(), "interaction navigation must retain every borrowed native target");
 		await js('await second.fill("#field", "LEGACY_SECOND_ONLY"); await second.click("button");');
 		assert.equal(await js('return await second.text("output");'), "LEGACY_SECOND_ONLY");
 		assert.equal(await js('return await main.value("#field");'), "");
@@ -210,6 +327,7 @@ try {
 		assert.deepEqual(await js("return await browser.tabs();"), []);
 		assert.deepEqual((await targets()).map(target => target.id).sort(), initial.map(target => target.id).sort());
 		console.log("PASS original npm 18.4.2 public frontend: default adoption, open reuse/navigation, URL-substring app.target, named borrowed pages, fill/click/canvas, decoded PNG/display, exact pixel diff/revisions, borrowed close/reopen/all-close, real errors");
+		console.log("PASS original npm 18.4.2 generic interactions: associated label, scoped Save + sibling isolation, delayed DOM confirmation, actual partial-run failure + observed resume without replay");
 		console.log("LEGACY GAPS: browser.open() needs an existing work page; relay opens never create owned pages; browser.targets() is absent; app.target matches URL/title substrings, not opaque target IDs. Owned relay close semantics are unavailable in this release.");
 	}
 	console.log("ENTRY LIMIT: unmodified npm 18.4.2 browser eval JavaScript + createBrowserPrelude SDK host; original CLI --version only, no LLM CLI flow");

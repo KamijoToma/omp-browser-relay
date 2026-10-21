@@ -57,6 +57,8 @@ At the **configured relay URL**, `GET /capabilities` returns versioned support/r
 
 The guide documents the existing `tab.drag`, `tab.mouseMove`, `tab.mouseDown` and `tab.mouseUp` APIs, viewport-CSS coordinates, custom trajectories, release in `finally`, compatibility and real-error handling. It does not advertise a CAPTCHA solver or invent APIs absent from older clients.
 
+For component controls and repeated forms, the same reference covers explicit label/control associations, scoped record edits, DOM postconditions, and reconciliation of completed, uncertain, and remaining work after a partial failure. The recipes use stock APIs, not framework-specific fallbacks or a new interaction facade. Minimum-disclosure guidance does not provide automatic screenshot, HAR, or tool-output redaction.
+
 When upgrading from 0.1, update both the service and extension, reload it in Chrome, and close any old reserved workspace tab. New workspaces have no reserved page.
 
 
@@ -115,7 +117,11 @@ RELAY_SMOKE_CLIENT=scripts/legacy-client.ts bun scripts/smoke.ts
 
 The first command installs exact npm 18.12.2 in a temporary fixture; the second links the source checkout read-only; the third installs exact npm 18.4.2. Fixtures do not add omp to this project's runtime dependencies. Each runs that version's real browser JavaScript facade and `createBrowserPrelude` SDK host, including serialized function arguments, not a replacement low-level client. CLI identity is checked with `--version`; no LLM-driven interactive CLI session is claimed.
 
+The original-client drivers also exercise a separate framework-free `/interaction` fixture: label activation of a non-hit-testable checkbox, scoped Save with sibling isolation, delayed DOM confirmation, and a real later API failure followed by observed continuation without repeating earlier side effects. These are browser API contracts, not evidence that an LLM follows the skill or that arbitrary websites are compatible.
+
 Version 0.2.0 passed these headed acceptance runs on Chrome 150.0.7871.24/Linux X11 with unmodified source 18.12.2 at `9d5d4ac5b50ac2bb5866e4202efc0cf785dfc57a`, npm 18.12.2 and npm 18.4.2. Checks include both `tab.drag` and custom captured mouse paths, forms, decoded screenshot/display pixels, diffs/revisions, real errors and owned/borrowed lifecycle. The 18.12.2 runs also decoded VP9 WebM after explicit stop and owned/borrowed close. Recording probes require `ffmpeg`/`ffprobe`; MP4 additionally needs libx264 and was not verified.
+
+The generic interaction contract additionally passed headless functional acceptance on Chrome 158.0.8106.0/macOS arm64 with the original npm 18.12.2 and 18.4.2 clients. The modern run also decoded the explicit-stop, owned-close, and borrowed-close VP9 recordings and verified their real frame/color content. This is not a new headed native-focus or LLM skill-compliance claim.
 
 `RELAY_SMOKE_SCREENSHOT=/path/result.png` saves the native capture. `RELAY_SMOKE_CLIENT=/path/client-probe.mjs` runs another Bun client against the temporary relay and fixture origin.
 

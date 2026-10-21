@@ -682,6 +682,57 @@ describe("RelayBridge Runtime sessions", () => {
 	});
 });
 
+describe("RelayBridge attach diagnostics", () => {
+	it("emits only allowlisted attach-failure metadata without sensitive URL, error, or command content", async () => {
+		const logs: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const bridge = new RelayBridge({ log: (message, data) => logs.push({ message, data }) });
+		const canaries = {
+			username: "private-user-canary",
+			password: "private-password-canary",
+			host: "private-host-canary",
+			path: "private-path-canary",
+			query: "private-query-canary",
+			fragment: "private-fragment-canary",
+			title: "private-title-canary",
+			error: "private-error-canary",
+			command: "private-command-canary",
+		};
+		const url = `https://${canaries.username}:${canaries.password}@${canaries.host}.example/${canaries.path}?token=${canaries.query}#${canaries.fragment}`;
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1, url, title: canaries.title })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const attachId = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: attachId,
+				method: "Target.attachToTarget",
+				params: { targetId: `PAGE${ANON}.1`, flatten: true, privateValue: canaries.command },
+			}),
+		);
+		expect(ext.pending("attach")).toHaveLength(1);
+		nack(bridge, ext, "attach", `Cannot attach ${url}: ${canaries.error}; params=${canaries.command}`);
+		await flush();
+
+		expect(logs.filter(entry => entry.message === "attach failed")).toEqual([
+			{
+				message: "attach failed",
+				data: { tabKey: `${ANON}:1`, operation: "attach", failure: "attachment_failed" },
+			},
+		]);
+		// Check everything the log consumer receives, not just selected metadata fields.
+		const emitted = JSON.stringify(logs);
+		for (const canary of Object.values(canaries)) expect(emitted).not.toContain(canary);
+		expect(emitted).not.toContain(url);
+
+		const reply = cdp.messages.find(message => message.id === attachId);
+		expect(reply?.error).toBeDefined();
+		expect(reply?.result).toBeUndefined();
+		expect(cdp.sessionFor(attachId)).toBeUndefined();
+	});
+});
+
 describe("RelayBridge attachment release", () => {
 	it("detaches cleanly on explicit last-session release and permits reattachment", async () => {
 		const bridge = new RelayBridge({});
@@ -857,7 +908,8 @@ describe("RelayBridge attachment release", () => {
 	});
 
 	it("does not ban a tab when its in-flight attach is interrupted by extension replacement", async () => {
-		const bridge = new RelayBridge({});
+		const logs: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const bridge = new RelayBridge({ log: (message, data) => logs.push({ message, data }) });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -871,6 +923,12 @@ describe("RelayBridge attachment release", () => {
 		const replacement = new FakeExtSocket();
 		connect(bridge, replacement, [tab({ tabId: 1 })]);
 		await flush();
+		expect(logs.filter(entry => entry.message === "attach failed")).toEqual([
+			{
+				message: "attach failed",
+				data: { tabKey: `${ANON}:1`, operation: "attach", failure: "extension_replaced" },
+			},
+		]);
 
 		const retryId = ++msgSeq;
 		bridge.cdpMessage(

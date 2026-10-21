@@ -405,6 +405,231 @@ describe("shared-control workspace", () => {
 		).rejects.toThrow("not in the dedicated");
 	});
 
+	test("a child removed during native selection never dispatches or falls back to the root", async () => {
+		const h = harness(),
+			a = await create(h.workspace),
+			b = await create(h.workspace);
+		await h.workspace.runRpc({ op: "attach", tabId: a.tabId });
+		h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+			sessionId: "old-child",
+			targetInfo: { targetId: "old-frame" },
+		});
+		await settle();
+		const entered = Promise.withResolvers<void>(),
+			finish = Promise.withResolvers<void>(),
+			update = h.api.tabs.update;
+		h.api.tabs.update = async (id, properties) => {
+			if (id === a.tabId) {
+				entered.resolve();
+				await finish.promise;
+			}
+			return update(id, properties);
+		};
+		const commands = [...h.commands];
+		const rejected = h.workspace
+			.runRpc({ op: "send", tabId: a.tabId, sessionId: "old-child", method: "Runtime.evaluate" })
+			.then(
+				() => false,
+				() => true,
+			);
+		await entered.promise;
+		h.api.tabs.update = update;
+		h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.detachedFromTarget", { sessionId: "old-child" });
+		await settle();
+		finish.resolve();
+		expect(await rejected).toBe(true);
+		expect(h.commands).toEqual(commands);
+
+		await h.api.tabs.update(b.tabId, { active: true });
+		const selections = [...h.selections];
+		await expect(
+			h.workspace.runRpc({ op: "send", tabId: a.tabId, sessionId: "old-child", method: "Runtime.evaluate" }),
+		).rejects.toThrow();
+		expect(h.commands).toEqual(commands);
+		expect(h.selections).toEqual(selections);
+
+		h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+			sessionId: "new-child",
+			targetInfo: { targetId: "new-frame" },
+		});
+		await settle();
+		const params = { expression: "1" };
+		await h.workspace.runRpc({
+			op: "send",
+			tabId: a.tabId,
+			sessionId: "new-child",
+			method: "Runtime.evaluate",
+			params,
+		});
+		await h.workspace.runRpc({ op: "send", tabId: a.tabId, method: "Runtime.evaluate", params });
+		expect(h.commands.slice(commands.length)).toEqual([
+			{ target: { tabId: a.tabId, sessionId: "new-child" }, method: "Runtime.evaluate", params },
+			{ target: { tabId: a.tabId }, method: "Runtime.evaluate", params },
+		]);
+	});
+
+	for (const childReference of ["destination", "detach parameter"] as const) {
+		test(`cleanup rechecks its child ${childReference} after asynchronous ownership`, async () => {
+			const h = harness(),
+				a = await create(h.workspace);
+			await create(h.workspace);
+			await h.workspace.runRpc({ op: "attach", tabId: a.tabId });
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+				sessionId: "old-child",
+				targetInfo: { targetId: "old-frame" },
+			});
+			await settle();
+			const entered = Promise.withResolvers<void>(),
+				finish = Promise.withResolvers<void>(),
+				get = h.api.tabs.get;
+			let lookups = 0;
+			h.api.tabs.get = async id => {
+				const tab = await get(id);
+				if (id === a.tabId && ++lookups === 2) {
+					entered.resolve();
+					await finish.promise;
+				}
+				return tab;
+			};
+			const destination = childReference === "destination";
+			const params: Record<string, unknown> = destination ? { requestId: "request" } : { sessionId: "old-child" };
+			const request = {
+				op: "send" as const,
+				tabId: a.tabId,
+				sessionId: destination ? "old-child" : undefined,
+				method: destination ? "Fetch.continueRequest" : "Target.detachFromTarget",
+				params,
+			};
+			const commands = [...h.commands],
+				selections = [...h.selections],
+				rejected = h.workspace.runRpc(request).then(
+					() => false,
+					() => true,
+				);
+			await entered.promise;
+			h.api.tabs.get = get;
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.detachedFromTarget", { sessionId: "old-child" });
+			await settle();
+			finish.resolve();
+			expect(await rejected).toBe(true);
+			expect(h.commands).toEqual(commands);
+			expect(h.selections).toEqual(selections);
+			await expect(h.workspace.runRpc(request)).rejects.toThrow();
+			expect(h.commands).toEqual(commands);
+
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+				sessionId: "new-child",
+				targetInfo: { targetId: "new-frame" },
+			});
+			await settle();
+			const newParams = destination ? params : { sessionId: "new-child" };
+			await h.workspace.runRpc({
+				...request,
+				sessionId: destination ? "new-child" : undefined,
+				params: newParams,
+			});
+			expect(h.commands.slice(commands.length)).toEqual([
+				{
+					target: destination ? { tabId: a.tabId, sessionId: "new-child" } : { tabId: a.tabId },
+					method: request.method,
+					params: newParams,
+				},
+			]);
+			expect(h.selections).toEqual(selections);
+		});
+	}
+
+	for (const detach of ["relay", "chrome"] as const) {
+		test(`events awaiting ownership cannot cross a ${detach} detach and re-attach`, async () => {
+			const h = harness(),
+				a = await create(h.workspace),
+				b = await create(h.workspace);
+			await h.workspace.runRpc({ op: "attach", tabId: a.tabId });
+			await h.workspace.runRpc({ op: "attach", tabId: b.tabId });
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+				sessionId: "reused-child",
+				targetInfo: { targetId: "old-frame" },
+			});
+			await settle();
+			const entered = Promise.withResolvers<void>(),
+				finish = Promise.withResolvers<void>(),
+				get = h.api.tabs.get,
+				gated = new Map([
+					[a.tabId, 3],
+					[b.tabId, 1],
+				]);
+			let lookups = 4;
+			h.api.tabs.get = async id => {
+				const tab = await get(id);
+				const remaining = gated.get(id) ?? 0;
+				if (remaining > 0) {
+					gated.set(id, remaining - 1);
+					if (--lookups === 0) entered.resolve();
+					await finish.promise;
+				}
+				return tab;
+			};
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+				sessionId: "stale-child",
+				targetInfo: { targetId: "stale-worker" },
+			});
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.detachedFromTarget", {
+				sessionId: "reused-child",
+			});
+			h.events.debuggerEvent.emit({ tabId: a.tabId, sessionId: "reused-child" }, "Runtime.consoleAPICalled", {
+				type: "log",
+				args: [],
+			});
+			const otherChild = { sessionId: "other-child", targetInfo: { targetId: "other-worker" } };
+			h.events.debuggerEvent.emit({ tabId: b.tabId }, "Target.attachedToTarget", otherChild);
+			await entered.promise;
+			h.api.tabs.get = get;
+			if (detach === "relay") await h.workspace.runRpc({ op: "detach", tabId: a.tabId });
+			else await h.api.debugger.detach({ tabId: a.tabId });
+			await h.workspace.runRpc({ op: "attach", tabId: a.tabId });
+			h.events.debuggerEvent.emit({ tabId: a.tabId }, "Target.attachedToTarget", {
+				sessionId: "reused-child",
+				targetInfo: { targetId: "new-frame" },
+			});
+			await settle();
+			h.events.debuggerEvent.emit({ tabId: a.tabId, sessionId: "reused-child" }, "Target.attachedToTarget", {
+				sessionId: "new-worker",
+				targetInfo: { targetId: "new-worker-target" },
+			});
+			await settle();
+			const messages = h.messages.filter(message => message.t === "cdpEvent");
+			finish.resolve();
+			await settle();
+			expect(h.messages.filter(message => message.t === "cdpEvent")).toEqual([
+				...messages,
+				{
+					t: "cdpEvent",
+					tabId: b.tabId,
+					sessionId: undefined,
+					method: "Target.attachedToTarget",
+					params: otherChild,
+				},
+			]);
+			const commands = h.commands.length;
+			await expect(
+				h.workspace.runRpc({ op: "send", tabId: a.tabId, sessionId: "stale-child", method: "Runtime.evaluate" }),
+			).rejects.toThrow();
+			expect(h.commands).toHaveLength(commands);
+			for (const [tabId, sessionId] of [
+				[a.tabId, "reused-child"],
+				[a.tabId, "new-worker"],
+				[b.tabId, "other-child"],
+			] as const) {
+				await h.workspace.runRpc({ op: "send", tabId, sessionId, method: "Runtime.evaluate" });
+			}
+			expect(h.commands.slice(commands)).toEqual([
+				{ target: { tabId: a.tabId, sessionId: "reused-child" }, method: "Runtime.evaluate", params: undefined },
+				{ target: { tabId: a.tabId, sessionId: "new-worker" }, method: "Runtime.evaluate", params: undefined },
+				{ target: { tabId: b.tabId, sessionId: "other-child" }, method: "Runtime.evaluate", params: undefined },
+			]);
+		});
+	}
+
 	test("moving an existing user page in grants control and moving it out revokes it", async () => {
 		const h = harness(),
 			a = await create(h.workspace);

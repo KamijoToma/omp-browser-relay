@@ -13,12 +13,18 @@
 - Added a portable, opt-in `install-skill` command documenting existing stock omp drag/mouse APIs.
 - Added `/capabilities` and `/docs`, with the same canonical reference packaged for the installed skill.
 - Added shared-control, migration, cancellation, native-view and last-business-tab lifecycle regressions.
+- Added generic interaction guidance for actionable targets, scoped forms, DOM postconditions, partial-progress recovery, and minimum disclosure using stock browser APIs.
+- Added framework-free interaction acceptance scenarios to the modern and legacy original-client drivers.
 
 ### Fixed
 
 - Preserved a successful last-tab close acknowledgement when its own window-removal event arrives first.
 - New-page provisioning now survives a closed last-tab window and delayed removal notifications while old page commands are cancelled.
 - Prevented a late move-in lookup from re-advertising a tab after it has moved out again.
+- Revalidated child-session destinations and detach parameters after asynchronous selection or ownership checks, before native dispatch.
+- Fenced delayed debugger events by attachment generation so stale events cannot alter a replacement attachment's child sessions.
+- Restricted attach-failure diagnostics to allowlisted operation and target metadata, excluding page URLs and arbitrary error text.
+- Normalized media subprocess output to a byte view in original-client recording acceptance, preserving full-frame decode and visible color-state checks.
 
 ### Native Focus Policy
 
