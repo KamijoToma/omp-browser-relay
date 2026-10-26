@@ -16,6 +16,9 @@
 - Added generic interaction guidance for actionable targets, scoped forms, DOM postconditions, partial-progress recovery, and minimum disclosure using stock browser APIs.
 - Added framework-free interaction acceptance scenarios to the modern and legacy original-client drivers.
 
+- Added configurable relay bind hostname with a loopback default and Tailscale/firewall guidance for remote CDP access.
+- Added an extension-options Tailscale access toggle that enables or disables a filtered remote listener live, preserves the loopback extension connection, and provides a copyable remote TUI command with clipboard-write permission.
+
 ### Fixed
 
 - Preserved a successful last-tab close acknowledgement when its own window-removal event arrives first.

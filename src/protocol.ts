@@ -37,7 +37,24 @@ export type RelayRpcRequest =
 	/** Select a workspace tab without focusing its window. */
 	| { op: "activateTab"; tabId: number };
 
-export type RelayToExtMessage = ({ t: "rpc"; id: number } & RelayRpcRequest) | { t: "pong" };
+export interface TailnetAccessRequest {
+	t: "tailnetAccessRequest";
+	requestId: number;
+	/** Omit to query current state. */
+	enabled?: boolean;
+}
+
+export interface TailnetAccessResult {
+	t: "tailnetAccessResult";
+	requestId: number;
+	ok: boolean;
+	enabled: boolean;
+	port: number;
+	tailnetAddresses: string[];
+	error?: string;
+}
+
+export type RelayToExtMessage = ({ t: "rpc"; id: number } & RelayRpcRequest) | { t: "pong" } | TailnetAccessResult;
 
 export type ExtToRelayMessage =
 	| {
@@ -59,6 +76,7 @@ export type ExtToRelayMessage =
 	| { t: "tabUpdated"; tab: TabSnapshot }
 	| { t: "tabRemoved"; tabId: number }
 	| { t: "rpcResult"; id: number; ok: boolean; result?: unknown; error?: string }
+	| { t: "tailnetAccessRequest"; requestId: number; enabled?: boolean }
 	| { t: "ping" };
 
 /** Present on both ready (200) and waiting-for-extension (503) discovery replies. */

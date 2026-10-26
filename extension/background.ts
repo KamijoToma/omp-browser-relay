@@ -1,5 +1,5 @@
 /** MV3 transport; workspace.ts enforces dedicated-window ownership on every RPC. */
-import type { ExtToRelayMessage, RelayToExtMessage } from "../src/protocol";
+import type { ExtToRelayMessage, RelayToExtMessage, TailnetAccessResult } from "../src/protocol";
 import { Workspace } from "./workspace";
 
 const DEFAULT_PORT = 9224;
@@ -13,6 +13,75 @@ let pingTimer: Timer | null = null;
 let reconnectTimer: Timer | null = null;
 let cleanup: Promise<void> = Promise.resolve();
 let identity: Promise<string> | null = null;
+interface PendingTailnetRequest {
+	resolve(result: TailnetAccessResult): void;
+	reject(error: Error): void;
+	timer: Timer;
+}
+
+interface RelayOpenWaiter {
+	resolve(socket: WebSocket): void;
+	reject(error: Error): void;
+	timer: Timer;
+}
+
+const pendingTailnetRequests = new Map<number, PendingTailnetRequest>();
+const relayOpenWaiters = new Set<RelayOpenWaiter>();
+let nextTailnetRequestId = 0;
+
+function waitForRelaySocket(): Promise<WebSocket> {
+	if (ws?.readyState === WebSocket.OPEN) return Promise.resolve(ws);
+	if (!ws && !connecting) void connect();
+	const { promise, resolve, reject } = Promise.withResolvers<WebSocket>();
+	const waiter: RelayOpenWaiter = {
+		resolve,
+		reject,
+		timer: setTimeout(() => {
+			relayOpenWaiters.delete(waiter);
+			reject(new Error("Relay connection is not available."));
+		}, 15_000),
+	};
+	relayOpenWaiters.add(waiter);
+	return promise;
+}
+
+async function requestTailnetAccess(enabled?: boolean): Promise<TailnetAccessResult> {
+	const socket = await waitForRelaySocket();
+	if (ws !== socket || socket.readyState !== WebSocket.OPEN) {
+		throw new Error("Relay connection is not available.");
+	}
+	const requestId = ++nextTailnetRequestId;
+	const { promise, resolve, reject } = Promise.withResolvers<TailnetAccessResult>();
+	const pending: PendingTailnetRequest = {
+		resolve,
+		reject,
+		timer: setTimeout(() => {
+			pendingTailnetRequests.delete(requestId);
+			reject(new Error("Relay did not respond to the Tailnet access request."));
+		}, 10_000),
+	};
+	pendingTailnetRequests.set(requestId, pending);
+	const message: ExtToRelayMessage =
+		enabled === undefined
+			? { t: "tailnetAccessRequest", requestId }
+			: { t: "tailnetAccessRequest", requestId, enabled };
+	try {
+		socket.send(JSON.stringify(message));
+	} catch (error) {
+		pendingTailnetRequests.delete(requestId);
+		clearTimeout(pending.timer);
+		reject(error instanceof Error ? error : new Error(String(error)));
+	}
+	return promise;
+}
+
+function rejectPendingTailnetRequests(error: Error): void {
+	for (const [requestId, pending] of pendingTailnetRequests) {
+		pendingTailnetRequests.delete(requestId);
+		clearTimeout(pending.timer);
+		pending.reject(error);
+	}
+}
 
 function ensureInstanceId(): Promise<string> {
 	identity ??= (async () => {
@@ -38,15 +107,31 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
 		!message ||
 		typeof message !== "object" ||
 		!("op" in message) ||
-		message.op !== "createWorkspaceTab" ||
 		sender.url !== chrome.runtime.getURL("options.html")
 	)
 		return false;
-	void workspace.runRpc({ op: "createTab", url: "about:blank" }).then(
-		() => reply({ ok: true }),
-		(error: unknown) => reply({ ok: false, error: error instanceof Error ? error.message : String(error) }),
-	);
-	return true;
+	if (message.op === "createWorkspaceTab") {
+		void workspace.runRpc({ op: "createTab", url: "about:blank" }).then(
+			() => reply({ ok: true }),
+			(error: unknown) => reply({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+		);
+		return true;
+	}
+	if (message.op === "getTailnetAccess") {
+		void requestTailnetAccess().then(
+			result => reply({ ...result }),
+			(error: unknown) => reply({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+		);
+		return true;
+	}
+	if (message.op === "setTailnetAccess" && "enabled" in message && typeof message.enabled === "boolean") {
+		void requestTailnetAccess(message.enabled).then(
+			result => reply({ ...result }),
+			(error: unknown) => reply({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+		);
+		return true;
+	}
+	return false;
 });
 
 async function setBadge(connected: boolean): Promise<void> {
@@ -63,6 +148,14 @@ function handleRelayMessage(socket: WebSocket, raw: string): void {
 	try {
 		message = JSON.parse(raw) as RelayToExtMessage;
 	} catch {
+		return;
+	}
+	if (message.t === "tailnetAccessResult") {
+		const pending = pendingTailnetRequests.get(message.requestId);
+		if (!pending) return;
+		pendingTailnetRequests.delete(message.requestId);
+		clearTimeout(pending.timer);
+		pending.resolve(message);
 		return;
 	}
 	if (message.t !== "rpc") return;
@@ -110,6 +203,11 @@ async function connect(): Promise<void> {
 		socket.onopen = () => {
 			reconnectDelay = RECONNECT_MIN_MS;
 			void setBadge(true);
+			for (const waiter of relayOpenWaiters) {
+				clearTimeout(waiter.timer);
+				relayOpenWaiters.delete(waiter);
+				waiter.resolve(socket);
+			}
 			void ensureInstanceId()
 				.then(id => workspace.hello(id, navigator.userAgent))
 				.then(hello => {
@@ -132,6 +230,7 @@ async function connect(): Promise<void> {
 			void setBadge(false);
 			cleanup = workspace.releaseAll();
 			scheduleReconnect();
+			rejectPendingTailnetRequests(new Error("Relay connection closed."));
 		};
 		socket.onerror = () => socket.close();
 	} catch {

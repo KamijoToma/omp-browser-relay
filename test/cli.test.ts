@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { version } from "../package.json";
-import { RELAY_CAPABILITIES } from "../src/protocol";
+import { RELAY_CAPABILITIES, RELAY_PROTOCOL_VERSION } from "../src/protocol";
 
 const CLI = path.resolve(import.meta.dir, "../src/cli.ts");
 
@@ -36,6 +36,10 @@ describe("standalone relay CLI", () => {
 		for (const args of [
 			["unknown"],
 			["--no-group"],
+			["--host"],
+			["--host", "127.0.0.1", "--port"],
+			["install", "--host", "0.0.0.0"],
+			["install-skill", "--host", "0.0.0.0"],
 			["--port"],
 			["--token"],
 			["--port", "-1"],
@@ -93,6 +97,72 @@ describe("standalone relay CLI", () => {
 			expect((await fetch(`http://127.0.0.1:${port}${capabilities.docs.path}`)).status).toBe(200);
 			expect((await fetch(`http://127.0.0.1:${port}/ext`)).status).toBe(401);
 		} finally {
+			reader.releaseLock();
+			child.kill("SIGTERM");
+			await child.exited;
+		}
+	});
+	it("binds the CLI to a non-loopback host while serving discovery through loopback", async () => {
+		const child = Bun.spawn([process.execPath, CLI, "--host", "0.0.0.0", "--port", "0"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const reader = child.stdout.getReader();
+		let extension: WebSocket | undefined;
+		try {
+			let output = "";
+			let match: RegExpExecArray | null = null;
+			while (!match) {
+				const chunk = await reader.read();
+				if (chunk.done) throw new Error("CLI exited without its readiness banner");
+				output += new TextDecoder().decode(chunk.value);
+				match = /browser relay listening on http:\/\/0\.0\.0\.0:(\d+)/.exec(output);
+			}
+			const port = Number(match[1]);
+			expect(port).toBeGreaterThan(0);
+
+			const base = `http://127.0.0.1:${port}`;
+			const capabilities = await fetch(`${base}/capabilities`);
+			expect(capabilities.status).toBe(200);
+
+			extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+			const { promise: extensionOpened, resolve, reject } = Promise.withResolvers<void>();
+			extension.addEventListener(
+				"open",
+				() => {
+					extension!.send(
+						JSON.stringify({
+							t: "hello",
+							protocolVersion: RELAY_PROTOCOL_VERSION,
+							browserSession: "test-run",
+							discardedTabsProtocol: 1,
+							instanceId: "test",
+							workspaceWindowId: 1,
+							userAgent: "test",
+							browserVersion: "Chrome/151.0.0.0",
+							tabs: [],
+							attachedTabIds: [],
+						}),
+					);
+					resolve();
+				},
+				{ once: true },
+			);
+			extension.addEventListener("error", () => reject(new Error("Extension socket failed to connect")), {
+				once: true,
+			});
+			await extensionOpened;
+
+			const host = "192.0.2.1:12803";
+			let versionResponse = await fetch(`${base}/json/version`, { headers: { host } });
+			const deadline = Date.now() + 1_000;
+			while (versionResponse.status !== 200 && Date.now() < deadline) {
+				versionResponse = await fetch(`${base}/json/version`, { headers: { host } });
+			}
+			expect(versionResponse.status).toBe(200);
+			expect((await versionResponse.json()).webSocketDebuggerUrl).toBe(`ws://${host}/cdp`);
+		} finally {
+			extension?.close();
 			reader.releaseLock();
 			child.kill("SIGTERM");
 			await child.exited;

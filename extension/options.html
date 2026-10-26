@@ -22,6 +22,19 @@
 				font: inherit;
 				box-sizing: border-box;
 			}
+			input[type="checkbox"] {
+				width: auto;
+				margin-right: 0.4rem;
+			}
+			#tailnet-status {
+				min-height: 1.25em;
+			}
+			#tailnet-command {
+				display: block;
+				overflow-wrap: anywhere;
+				padding: 0.5rem;
+				background: #f6f8fa;
+			}
 			button {
 				margin-top: 1.25rem;
 				padding: 0.45rem 1.1rem;
@@ -49,8 +62,8 @@
 			>; original copyright notices are preserved in LICENSE.
 		</p>
 		<p class="hint">
-			The extension connects to a local <code>omp-browser-relay</code> process. Values here must match the flags the
-			relay was started with.
+			The extension connects to a local <code>omp-browser-relay</code> process. The port and token must match its
+			flags; Tailscale access below can be enabled or disabled live.
 		</p>
 		<p class="hint">
 			Agent pages open in a separate workspace window. You can observe and operate them at any time; focusing this
@@ -71,6 +84,23 @@
 		<label for="token">Token (optional)</label>
 		<input id="token" type="text" autocomplete="off" />
 		<button id="save">Save</button><span id="status"></span>
+		<h2 id="tailnet-heading">Live Tailscale access</h2>
+		<p class="hint">
+			Remote CDP is unauthenticated. When enabled, only Tailscale IPv4 sources in <code>100.64.0.0/10</code> are
+			served; this shared range is not a device identity. Restrict peers with Tailscale ACLs and host firewall rules.
+			Disabling access disconnects active remote clients.
+		</p>
+		<label for="tailnet-enabled">
+			<input id="tailnet-enabled" type="checkbox" disabled />
+			Enable remote access over Tailscale
+		</label>
+		<p id="tailnet-status" role="status" aria-live="polite">Loading Tailscale access status…</p>
+		<label for="tailnet-address">Detected Tailscale IPv4 address</label>
+		<select id="tailnet-address" disabled></select>
+		<p id="tailnet-addresses" class="hint"></p>
+		<label for="tailnet-command">Remote connection command</label>
+		<code id="tailnet-command"></code>
+		<button id="copy-tailnet-command" type="button" disabled>Copy command</button>
 		<h2>Agent workspace</h2>
 		<p class="hint">
 			Older omp versions need an existing workspace page before connecting. Create a blank page here; newer versions

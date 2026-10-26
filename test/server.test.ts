@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { networkInterfaces } from "node:os";
 import { RELAY_CAPABILITIES, RELAY_PROTOCOL_VERSION } from "../src/protocol";
 import { type RelayServer, type RelayUnavailableInfo, startRelayServer } from "../src/server";
 
@@ -15,11 +16,11 @@ const EXTENSION_HELLO = {
 	attachedTabIds: [],
 } as const;
 
-async function rawGet(port: number, requestBytes: string): Promise<string> {
+async function rawGet(port: number, requestBytes: string, hostname = "127.0.0.1"): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	let response = "";
 	await Bun.connect({
-		hostname: "127.0.0.1",
+		hostname,
 		port,
 		socket: {
 			open(socket) {
@@ -86,6 +87,94 @@ async function connectExtension(port: number): Promise<WebSocket> {
 		{ once: true },
 	);
 	ws.addEventListener("error", () => reject(new Error("Extension socket failed to connect")), { once: true });
+	return promise;
+}
+
+type TailnetAccessResult = {
+	t: "tailnetAccessResult";
+	requestId: number;
+	ok: boolean;
+	enabled: boolean;
+	port: number;
+	tailnetAddresses: string[];
+	error?: string;
+};
+
+async function requestTailnetAccess(
+	ws: WebSocket,
+	request: { requestId: number; enabled?: boolean },
+): Promise<TailnetAccessResult> {
+	const { promise, resolve, reject } = Promise.withResolvers<TailnetAccessResult>();
+	const cleanup = () => {
+		ws.removeEventListener("message", onMessage);
+		ws.removeEventListener("close", onClose);
+		ws.removeEventListener("error", onError);
+	};
+	const fail = (error: Error) => {
+		cleanup();
+		reject(error);
+	};
+	const onMessage = (event: MessageEvent) => {
+		if (typeof event.data !== "string") return;
+		let response: unknown;
+		try {
+			response = JSON.parse(event.data);
+		} catch {
+			return;
+		}
+		if (response === null || typeof response !== "object" || Array.isArray(response)) return;
+		const message = response as Partial<TailnetAccessResult>;
+		if (message.t !== "tailnetAccessResult" || message.requestId !== request.requestId) return;
+		cleanup();
+		resolve(message as TailnetAccessResult);
+	};
+	const onClose = () => fail(new Error("Extension socket closed before the tailnet access response"));
+	const onError = () => fail(new Error("Extension socket failed before the tailnet access response"));
+	ws.addEventListener("message", onMessage);
+	ws.addEventListener("close", onClose, { once: true });
+	ws.addEventListener("error", onError, { once: true });
+	ws.send(JSON.stringify({ t: "tailnetAccessRequest", ...request }));
+	return promise;
+}
+
+async function findNonTailnetResponse(port: number): Promise<{ address: string; status: number } | undefined> {
+	const candidates = Object.values(networkInterfaces())
+		.flatMap(addresses => addresses ?? [])
+		.filter(
+			({ address, family, internal }) =>
+				family === "IPv4" && !internal && !address.startsWith("100.") && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address),
+		);
+	for (const { address } of candidates) {
+		try {
+			const response = await fetch(`http://${address}:${port}/json/version`, {
+				signal: AbortSignal.timeout(250),
+			});
+			return { address, status: response.status };
+		} catch {
+			continue;
+		}
+	}
+	return undefined;
+}
+
+function extensionUpgradeIsRejected(hostname: string, port: number): Promise<boolean> {
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const ws = new WebSocket(`ws://${hostname}:${port}/ext`);
+	let settled = false;
+	const finish = (rejected: boolean) => {
+		if (settled) return;
+		settled = true;
+		ws.removeEventListener("open", onOpen);
+		ws.removeEventListener("error", onRejected);
+		ws.removeEventListener("close", onRejected);
+		if (ws.readyState === WebSocket.OPEN) ws.close();
+		resolve(rejected);
+	};
+	const onOpen = () => finish(false);
+	const onRejected = () => finish(true);
+	ws.addEventListener("open", onOpen, { once: true });
+	ws.addEventListener("error", onRejected, { once: true });
+	ws.addEventListener("close", onRejected, { once: true });
 	return promise;
 }
 
@@ -169,9 +258,9 @@ describe("browser relay discovery endpoint", () => {
 		const port = await startReadyRelay();
 		const response = await rawGet(
 			port,
-			"GET /json/version HTTP/1.1\r\nHost: 100.100.92.97:12803\r\nConnection: close\r\n\r\n",
+			"GET /json/version HTTP/1.1\r\nHost: 192.0.2.1:12803\r\nConnection: close\r\n\r\n",
 		);
-		expect(parseVersion(response).webSocketDebuggerUrl).toBe("ws://100.100.92.97:12803/cdp");
+		expect(parseVersion(response).webSocketDebuggerUrl).toBe("ws://192.0.2.1:12803/cdp");
 		expect(parseVersion(response).ompRelay).toEqual(RELAY_CAPABILITIES);
 	});
 
@@ -217,6 +306,20 @@ describe("browser relay discovery endpoint", () => {
 		}
 		expect(response.status).toBe(503);
 		expect(((await response.json()) as RelayUnavailableInfo).extensionSeen).toBeTrue();
+	});
+
+	it("listens on a non-loopback hostname while remaining reachable through loopback", async () => {
+		relay = startRelayServer({ hostname: "0.0.0.0", port: 0 });
+		const port = relay.port;
+		const base = `http://127.0.0.1:${port}`;
+		expect((await fetch(`${base}/capabilities`)).status).toBe(200);
+		extension = await connectExtension(port);
+		await waitForDiscovery(port);
+
+		const host = "192.0.2.1:12803";
+		const response = await fetch(`${base}/json/version`, { headers: { host } });
+		expect(response.status).toBe(200);
+		expect((await response.json()).webSocketDebuggerUrl).toBe(`ws://${host}/cdp`);
 	});
 
 	it("returns the real ephemeral listening port", async () => {
@@ -273,5 +376,69 @@ describe("browser relay discovery endpoint", () => {
 		relay = startRelayServer({ port: 0 });
 		expect(() => startRelayServer({ port: relay!.port })).toThrow();
 		expect((await fetch(`http://127.0.0.1:${relay.port}/json/version`)).status).toBe(503);
+	});
+	it("controls tailnet exposure through the extension socket without disturbing loopback readiness", async () => {
+		const port = await startReadyRelay();
+		const base = `http://127.0.0.1:${port}`;
+
+		const queried = await requestTailnetAccess(extension!, { requestId: 101 });
+		expect(queried).toMatchObject({
+			t: "tailnetAccessResult",
+			requestId: 101,
+			ok: true,
+			enabled: false,
+			port,
+		});
+		expect(Array.isArray(queried.tailnetAddresses)).toBeTrue();
+		expect(queried.tailnetAddresses.every(address => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address))).toBeTrue();
+
+		const enabled = await requestTailnetAccess(extension!, { requestId: 102, enabled: true });
+		expect(enabled).toMatchObject({
+			t: "tailnetAccessResult",
+			requestId: 102,
+			ok: true,
+			enabled: true,
+			port,
+			tailnetAddresses: queried.tailnetAddresses,
+		});
+		const tailnetAddress = queried.tailnetAddresses[0];
+		if (tailnetAddress !== undefined) {
+			const remoteResponse = await fetch(`http://${tailnetAddress}:${port}/json/version`, {
+				signal: AbortSignal.timeout(1_500),
+			});
+			expect(remoteResponse.status).toBe(200);
+			expect(await extensionUpgradeIsRejected(tailnetAddress, port)).toBeTrue();
+		}
+
+		const nonTailnetResponse = await findNonTailnetResponse(port);
+		if (nonTailnetResponse !== undefined) {
+			expect(nonTailnetResponse.status).toBe(403);
+			expect(await extensionUpgradeIsRejected(nonTailnetResponse.address, port)).toBeTrue();
+		}
+
+		const readyWhileEnabled = await (await fetch(`${base}/capabilities`)).json();
+		expect(readyWhileEnabled.backend).toMatchObject({ ready: true, extensionSeen: true });
+
+		const disabled = await requestTailnetAccess(extension!, { requestId: 103, enabled: false });
+		expect(disabled).toMatchObject({
+			t: "tailnetAccessResult",
+			requestId: 103,
+			ok: true,
+			enabled: false,
+			port,
+			tailnetAddresses: queried.tailnetAddresses,
+		});
+		if (tailnetAddress !== undefined) {
+			const remoteUnavailable = await fetch(`http://${tailnetAddress}:${port}/json/version`, {
+				signal: AbortSignal.timeout(1_500),
+			}).then(
+				response => response.status !== 200,
+				() => true,
+			);
+			expect(remoteUnavailable).toBeTrue();
+		}
+
+		const readyAfterDisable = await (await fetch(`${base}/capabilities`)).json();
+		expect(readyAfterDisable.backend).toMatchObject({ ready: true, extensionSeen: true });
 	});
 });

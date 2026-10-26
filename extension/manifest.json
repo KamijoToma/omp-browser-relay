@@ -7,7 +7,7 @@
 	"description": "Independent fork by KamijoToma: shared-control workspace windows, visible business tabs, and window-scoped CDP. Not bundled OMP.",
 	"author": "KamijoToma",
 	"homepage_url": "https://github.com/KamijoToma/omp-browser-relay",
-	"permissions": ["debugger", "tabs", "storage", "alarms"],
+	"permissions": ["debugger", "tabs", "storage", "alarms", "clipboardWrite"],
 	"background": {
 		"service_worker": "background.js"
 	},

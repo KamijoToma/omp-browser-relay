@@ -5,13 +5,13 @@ import * as path from "node:path";
 import { version } from "../package.json";
 import { startRelayServer } from "./server";
 
-const HELP = `Usage: omp-browser-relay [serve] [--port <port>] [--token <secret>] [--verbose]
+const HELP = `Usage: omp-browser-relay [serve] [--host <hostname>] [--port <port>] [--token <secret>] [--verbose]
        omp-browser-relay install [--dir <directory>]
        omp-browser-relay install-skill [--dir <directory>]
        omp-browser-relay --help | --version
 
 Commands:
-  serve          Listen on loopback for the Chrome extension and CDP clients (default)
+  serve          Listen for the Chrome extension and CDP clients (default: 127.0.0.1)
   install        Copy the built Chrome extension for loading as an unpacked extension
   install-skill  Copy the agent skill and canonical relay reference (opt-in)
 
@@ -20,6 +20,7 @@ Discovery:
   GET /docs          Canonical browser API usage reference
 
 Options:
+  --host     Advanced listener hostname (default: 127.0.0.1; 0.0.0.0 enables Tailnet source filtering)
   -p, --port  Listening port (default: 9224; 0 chooses an available port)
   --token     Require this shared secret on the extension WebSocket endpoint
   --verbose   Log relay activity
@@ -30,6 +31,7 @@ Options:
 
 interface CliOptions {
 	action: "serve" | "install" | "install-skill";
+	hostname: string;
 	port: number;
 	token?: string;
 	verbose: boolean;
@@ -39,18 +41,26 @@ interface CliOptions {
 }
 
 function parseArgs(argv: string[]): CliOptions {
-	const options: CliOptions = { action: "serve", port: 9224, verbose: false, help: false, showVersion: false };
+	const options: CliOptions = {
+		action: "serve",
+		hostname: "127.0.0.1",
+		port: 9224,
+		verbose: false,
+		help: false,
+		showVersion: false,
+	};
 	const args = [...argv];
 	if (args[0] === "serve" || args[0] === "install" || args[0] === "install-skill") {
 		options.action = args.shift() as CliOptions["action"];
 	}
 	let portProvided = false;
+	let hostProvided = false;
 	while (args.length > 0) {
 		const argument = args.shift()!;
 		const separator = argument.indexOf("=");
 		const flag = separator < 0 ? argument : argument.slice(0, separator);
 		const inline = separator < 0 ? undefined : argument.slice(separator + 1);
-		if (flag === "--port" || flag === "-p" || flag === "--token" || flag === "--dir") {
+		if (flag === "--port" || flag === "-p" || flag === "--host" || flag === "--token" || flag === "--dir") {
 			const value = inline ?? args.shift();
 			if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
 			if (flag === "--port" || flag === "-p") {
@@ -58,6 +68,9 @@ function parseArgs(argv: string[]): CliOptions {
 					throw new Error("Port must be an integer from 0 to 65535");
 				options.port = Number(value);
 				portProvided = true;
+			} else if (flag === "--host") {
+				options.hostname = value;
+				hostProvided = true;
 			} else if (flag === "--token") options.token = value;
 			else options.dir = value;
 			continue;
@@ -71,8 +84,8 @@ function parseArgs(argv: string[]): CliOptions {
 	if (options.action === "serve" && options.dir !== undefined) {
 		throw new Error("--dir is only valid for install or install-skill");
 	}
-	if (options.action !== "serve" && (portProvided || options.token !== undefined || options.verbose)) {
-		throw new Error("--port, --token and --verbose are only valid for serve");
+	if (options.action !== "serve" && (portProvided || hostProvided || options.token !== undefined || options.verbose)) {
+		throw new Error("--host, --port, --token and --verbose are only valid for serve");
 	}
 	return options;
 }
@@ -134,11 +147,13 @@ async function main(): Promise<void> {
 		return;
 	}
 	const relay = startRelayServer({
+		hostname: options.hostname,
 		port: options.port,
 		token: options.token,
 		log: options.verbose ? (message, data) => console.error(`[relay] ${message}`, data ?? "") : undefined,
 	});
-	const baseUrl = `http://127.0.0.1:${relay.port}`;
+	const urlHost = options.hostname.includes(":") ? `[${options.hostname}]` : options.hostname;
+	const baseUrl = `http://${urlHost}:${relay.port}`;
 	console.log(`browser relay listening on ${baseUrl}`);
 	console.log(`Capabilities: ${baseUrl}/capabilities`);
 	console.log(`API reference: ${baseUrl}/docs`);

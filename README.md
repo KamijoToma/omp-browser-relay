@@ -26,18 +26,31 @@ Ensure Bun's global bin directory is on `PATH`. The installer copies the built e
 
 ## Connect unmodified omp
 
-Start this project's service **before** opening omp. A separate port avoids a previously started stock relay:
+Start this project's service **before** opening omp. A separate port avoids a previously started stock relay. By default, the service binds to `127.0.0.1`:
 
 ```sh
 omp-browser-relay serve --port 9333
 ```
 
-Open the extension options and save port `9333`. If you start the service with `--token`, save the same token there. Configure the stock client, without changing any omp code:
+For remote TUI access over Tailscale, keep the relay's default loopback listener and enable **Tailscale access** in the extension options page. This live toggle adds or removes the remote listener without restarting the relay. The local extension continues to connect to `127.0.0.1`; it does not connect through the remote Tailscale address. The options page shows detected Tailscale addresses and offers a copyable command for configuring a remote TUI:
+
+```sh
+omp config set browser.relayUrl http://<computer-tailnet-ip>:<port>
+```
+
+When enabled, the relay adds a wildcard (`0.0.0.0`) listener on the same port. Application-level source filtering accepts remote CDP connections only from Tailscale IPv4 addresses in `100.64.0.0/10`; that shared address range is not a device identity. `/ext` remains loopback-only. Disabling access stops the remote listener and disconnects active remote CDP clients. CDP clients are unauthenticated, so use Tailscale ACLs and host firewall rules to restrict peers. Do not expose the relay publicly.
+
+The CLI `--host` option remains available for advanced deployments. `--host 0.0.0.0` starts with Tailscale access enabled and applies the same source filtering; prefer the extension toggle to enable or disable the additional listener at runtime. `--token` authenticates the browser extension connection only, not CDP clients.
+
+Open the extension options on the computer running the relay and save its port. If you start the service with `--token`, save the same token there. Configure the local omp profile:
 
 ```sh
 omp config set browser.relayUrl http://127.0.0.1:9333
 PI_BROWSER_RELAY=1 omp
 ```
+
+For a remote TUI, set its own omp profile's `browser.relayUrl` to the Tailscale address and port shown by the extension options page, using the command above.
+
 
 Alternatively, opt in per call with `browser.open({ app: { relay: true }, url: "https://example.com" })`, or set `browser.relay` to `true` for the profile. `PI_BROWSER_RELAY` remains the stock client's override.
 
@@ -83,7 +96,7 @@ This is **target authorization, not browser-profile isolation or a verified nati
 
 Browser/system permissions, native file/authentication dialogs, and sites or evaluated JavaScript that actively request windows or focus are **not sandboxed** by the relay. There is no unconditional focus guarantee for those flows, and no automatic foreground-recovery path. Global browser/window commands, profile-wide permission overrides, and download behavior configuration are rejected. Clipboard and native UI workflows are outside the background-isolation contract. Chrome may show its own debugger notification, and a tab with another debugger/DevTools attached cannot be driven.
 
-The HTTP/WebSocket server binds loopback and rejects web-origin CDP clients. **Local native processes that can reach the CDP port can control the workspace in the signed-in profile.** `--token` authenticates the extension connection only; it does not authenticate CDP clients or protect against untrusted local processes.
+- The HTTP/WebSocket server binds to `127.0.0.1` by default and rejects web-origin CDP clients. The extension-page Tailscale access toggle adds a wildcard socket on the same port without restarting; application-level source filtering accepts remote CDP only from Tailscale IPv4 `100.64.0.0/10`, while `/ext` remains loopback-only. This CGNAT range is not a device identity; Tailscale ACLs and host firewall rules should restrict peers. Disabling the toggle closes active remote CDP connections. The CLI `--host 0.0.0.0` starts with Tailscale access enabled and uses the same source filter. Never expose the relay publicly. **CDP clients are not authenticated.** `--token` authenticates the extension connection only, not CDP clients.
 
 Moving a page out revokes future relay commands; already-dispatched JavaScript, timers or network requests cannot be rolled back. Stock clients own retry/cleanup bookkeeping and disconnect wording. Chrome-restricted pages and other debugger attachments can make access fail; the relay does not substitute another page or synthesize success.
 
