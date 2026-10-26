@@ -19,6 +19,7 @@ import { RELAY_REFERENCE, relayCapabilities } from "./capabilities";
 import {
 	RELAY_CAPABILITIES,
 	type RelayUnavailableInfo,
+	type TailnetAccessAck,
 	type TailnetAccessRequest,
 	type TailnetAccessResult,
 } from "./protocol";
@@ -85,26 +86,26 @@ function getTailnetIpv4Addresses(): string[] {
 /** Start the relay on the configured hostname (loopback by default). */
 export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const log = opts.log ?? (() => {});
-	const hostname = opts.hostname ?? "127.0.0.1";
+	let hostname = opts.hostname ?? "127.0.0.1";
 	const bridge = new RelayBridge({ log });
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
 	let tailnetAccessEnabled = hostname === "0.0.0.0";
-	let remoteServer: Bun.Server<SocketData> | undefined;
+	let pendingTailnetTransition:
+		| { requestId: number; enabled: boolean; socket: RelayWebSocket; timer: Timer }
+		| undefined;
 	let server: Bun.Server<SocketData>;
+	let rebindInProgress = false;
+	let stopped = false;
 
-	const createListener = (listenHostname: string, port: number, reusePort = false): Bun.Server<SocketData> =>
+	const createListener = (listenHostname: string, port: number): Bun.Server<SocketData> =>
 		Bun.serve<SocketData>({
 			hostname: listenHostname,
 			port,
-			reusePort,
 			fetch(req, srv): Response | undefined {
 				const address = srv.requestIP(req)?.address ?? "";
 				const normalizedAddress = address.toLowerCase().replace(/^::ffff:/, "");
-				const local =
-					normalizedAddress === "::1" ||
-					normalizedAddress.startsWith("127.") ||
-					normalizedAddress.startsWith("localhost");
+				const local = normalizedAddress === "::1" || normalizedAddress.startsWith("127.");
 				if (!local && !(tailnetAccessEnabled && isTailnetIpv4(address))) {
 					return new Response("Forbidden", { status: 403 });
 				}
@@ -191,32 +192,101 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 							incoming !== null &&
 							typeof incoming === "object" &&
 							"t" in incoming &&
+							incoming.t === "tailnetAccessAck"
+						) {
+							const ack = incoming as TailnetAccessAck;
+							const transition = pendingTailnetTransition;
+							if (
+								transition !== undefined &&
+								Number.isSafeInteger(ack.requestId) &&
+								transition.requestId === ack.requestId &&
+								transition.socket === ws
+							) {
+								clearTimeout(transition.timer);
+								pendingTailnetTransition = undefined;
+								const previousHostname = hostname;
+								const previousAccess = tailnetAccessEnabled;
+								const port = server.port!;
+								const nextHostname = transition.enabled ? "0.0.0.0" : "127.0.0.1";
+								const currentServer = server;
+								rebindInProgress = true;
+								void currentServer.stop(true).then(
+									() => {
+										if (stopped) {
+											rebindInProgress = false;
+											return;
+										}
+										try {
+											// Rebind one listener instead of relying on SO_REUSEPORT across platforms.
+											server = createListener(nextHostname, port);
+											hostname = nextHostname;
+											tailnetAccessEnabled = transition.enabled;
+											log("tailnet access changed", {
+												enabled: tailnetAccessEnabled,
+												hostname,
+												port: server.port,
+											});
+										} catch {
+											hostname = previousHostname;
+											tailnetAccessEnabled = previousAccess;
+											try {
+												server = createListener(previousHostname, port);
+											} catch {
+												log("relay listener recovery failed", { port });
+												rebindInProgress = false;
+												return;
+											}
+											log("tailnet access rebind failed", {
+												enabled: transition.enabled,
+												hostname: previousHostname,
+												port: server.port,
+											});
+										}
+										rebindInProgress = false;
+									},
+									() => {
+										rebindInProgress = false;
+										log("relay listener stop failed", { port });
+									},
+								);
+							}
+							return;
+						}
+						if (
+							ws.data.isLocal &&
+							incoming !== null &&
+							typeof incoming === "object" &&
+							"t" in incoming &&
 							incoming.t === "tailnetAccessRequest"
 						) {
 							const request = incoming as TailnetAccessRequest;
 							if (!Number.isSafeInteger(request.requestId) || request.requestId < 1) return;
 							let error: string | undefined;
+							let rebindRequired = false;
 							if (request.enabled !== undefined) {
 								if (typeof request.enabled !== "boolean") {
 									error = "Invalid Tailnet access setting.";
-								} else {
-									try {
-										if (request.enabled !== tailnetAccessEnabled) {
-											if (request.enabled && hostname !== "0.0.0.0") {
-												remoteServer = createListener("0.0.0.0", server.port!, true);
-											}
-											tailnetAccessEnabled = request.enabled;
-											if (!request.enabled) {
-												remoteServer?.stop(true);
-												remoteServer = undefined;
-											}
-											log("tailnet access changed", {
-												enabled: tailnetAccessEnabled,
-												port: server.port,
-											});
-										}
-									} catch {
-										error = "Could not open the remote listener on this port.";
+								} else if (pendingTailnetTransition || rebindInProgress) {
+									error = "A Tailnet listener change is already in progress.";
+								} else if (request.enabled !== tailnetAccessEnabled) {
+									const nextHostname = request.enabled ? "0.0.0.0" : "127.0.0.1";
+									if (nextHostname === hostname) {
+										tailnetAccessEnabled = request.enabled;
+									} else {
+										pendingTailnetTransition = {
+											requestId: request.requestId,
+											enabled: request.enabled,
+											socket: ws,
+											timer: setTimeout(() => {
+												if (pendingTailnetTransition?.requestId !== request.requestId) return;
+												pendingTailnetTransition = undefined;
+												log("tailnet access transition timed out", {
+													requestId: request.requestId,
+													port: server.port,
+												});
+											}, 10_000),
+										};
+										rebindRequired = true;
 									}
 								}
 							}
@@ -224,9 +294,10 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 								t: "tailnetAccessResult",
 								requestId: request.requestId,
 								ok: error === undefined,
-								enabled: tailnetAccessEnabled,
+								enabled: rebindRequired ? request.enabled! : tailnetAccessEnabled,
 								port: server.port!,
 								tailnetAddresses: getTailnetIpv4Addresses(),
+								...(rebindRequired ? { rebindRequired: true } : {}),
 								...(error === undefined ? {} : { error }),
 							};
 							ws.send(JSON.stringify(result));
@@ -240,6 +311,10 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				close(ws: RelayWebSocket): void {
 					sockets.delete(ws);
 					if (ws.data.role === "ext") {
+						if (pendingTailnetTransition?.socket === ws) {
+							clearTimeout(pendingTailnetTransition.timer);
+							pendingTailnetTransition = undefined;
+						}
 						bridge.extClosed(ws);
 					} else if (ws.data.connId !== undefined) {
 						bridge.cdpClosed(ws.data.connId);
@@ -249,9 +324,6 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 		});
 
 	server = createListener(hostname, opts.port);
-	if (tailnetAccessEnabled && hostname !== "0.0.0.0") {
-		remoteServer = createListener("0.0.0.0", server.port!, true);
-	}
 
 	// Puppeteer connections go silent while the agent is idle; protocol-level
 	// pings count as activity and keep them under the idle timeout.
@@ -265,8 +337,9 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 		bridge,
 		port: server.port!,
 		stop() {
+			stopped = true;
 			clearInterval(keepalive);
-			remoteServer?.stop(true);
+			if (pendingTailnetTransition) clearTimeout(pendingTailnetTransition.timer);
 			server.stop(true);
 		},
 	};

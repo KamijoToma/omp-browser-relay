@@ -17,7 +17,7 @@
 - Added framework-free interaction acceptance scenarios to the modern and legacy original-client drivers.
 
 - Added configurable relay bind hostname with a loopback default and Tailscale/firewall guidance for remote CDP access.
-- Added an extension-options Tailscale access toggle that enables or disables a filtered remote listener live, preserves the loopback extension connection, and provides a copyable remote TUI command with clipboard-write permission.
+- Added an extension-options Tailscale access toggle that live-rebinds the relay's single listening socket without restarting the process, briefly reconnects the local extension, and provides a copyable remote TUI command with clipboard-write permission.
 
 ### Fixed
 

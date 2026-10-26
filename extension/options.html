@@ -88,7 +88,8 @@
 		<p class="hint">
 			Remote CDP is unauthenticated. When enabled, only Tailscale IPv4 sources in <code>100.64.0.0/10</code> are
 			served; this shared range is not a device identity. Restrict peers with Tailscale ACLs and host firewall rules.
-			Disabling access disconnects active remote clients.
+			Changing access replaces the listening socket and disconnects active CDP clients; the local extension briefly
+			reconnects.
 		</p>
 		<label for="tailnet-enabled">
 			<input id="tailnet-enabled" type="checkbox" disabled />

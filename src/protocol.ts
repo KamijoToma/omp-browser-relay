@@ -51,7 +51,14 @@ export interface TailnetAccessResult {
 	enabled: boolean;
 	port: number;
 	tailnetAddresses: string[];
+	/** The listener will be replaced after the extension acknowledges this response. */
+	rebindRequired?: boolean;
 	error?: string;
+}
+
+export interface TailnetAccessAck {
+	t: "tailnetAccessAck";
+	requestId: number;
 }
 
 export type RelayToExtMessage = ({ t: "rpc"; id: number } & RelayRpcRequest) | { t: "pong" } | TailnetAccessResult;
@@ -77,6 +84,7 @@ export type ExtToRelayMessage =
 	| { t: "tabRemoved"; tabId: number }
 	| { t: "rpcResult"; id: number; ok: boolean; result?: unknown; error?: string }
 	| { t: "tailnetAccessRequest"; requestId: number; enabled?: boolean }
+	| TailnetAccessAck
 	| { t: "ping" };
 
 /** Present on both ready (200) and waiting-for-extension (503) discovery replies. */

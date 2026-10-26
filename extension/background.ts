@@ -17,6 +17,7 @@ interface PendingTailnetRequest {
 	resolve(result: TailnetAccessResult): void;
 	reject(error: Error): void;
 	timer: Timer;
+	reconnect?: Promise<WebSocket>;
 }
 
 interface RelayOpenWaiter {
@@ -25,8 +26,16 @@ interface RelayOpenWaiter {
 	timer: Timer;
 }
 
+interface RelayReconnectWaiter {
+	previous: WebSocket;
+	resolve(socket: WebSocket): void;
+	reject(error: Error): void;
+	timer: Timer;
+}
+
 const pendingTailnetRequests = new Map<number, PendingTailnetRequest>();
 const relayOpenWaiters = new Set<RelayOpenWaiter>();
+const relayReconnectWaiters = new Set<RelayReconnectWaiter>();
 let nextTailnetRequestId = 0;
 
 function waitForRelaySocket(): Promise<WebSocket> {
@@ -44,9 +53,26 @@ function waitForRelaySocket(): Promise<WebSocket> {
 	relayOpenWaiters.add(waiter);
 	return promise;
 }
+function waitForRelayReconnect(previous: WebSocket): Promise<WebSocket> {
+	if (ws && ws !== previous && ws.readyState === WebSocket.OPEN) return Promise.resolve(ws);
+	const { promise, resolve, reject } = Promise.withResolvers<WebSocket>();
+	const waiter: RelayReconnectWaiter = {
+		previous,
+		resolve,
+		reject,
+		timer: setTimeout(() => {
+			relayReconnectWaiters.delete(waiter);
+			reject(new Error("Relay listener changed, but the extension did not reconnect."));
+		}, 15_000),
+	};
+	relayReconnectWaiters.add(waiter);
+	return promise;
+}
 
-async function requestTailnetAccess(enabled?: boolean): Promise<TailnetAccessResult> {
-	const socket = await waitForRelaySocket();
+function sendTailnetAccessRequest(
+	socket: WebSocket,
+	enabled?: boolean,
+): { response: Promise<TailnetAccessResult>; pending: PendingTailnetRequest } {
 	if (ws !== socket || socket.readyState !== WebSocket.OPEN) {
 		throw new Error("Relay connection is not available.");
 	}
@@ -72,7 +98,25 @@ async function requestTailnetAccess(enabled?: boolean): Promise<TailnetAccessRes
 		clearTimeout(pending.timer);
 		reject(error instanceof Error ? error : new Error(String(error)));
 	}
-	return promise;
+	return { response: promise, pending };
+}
+
+async function requestTailnetAccess(enabled?: boolean): Promise<TailnetAccessResult> {
+	const socket = await waitForRelaySocket();
+	const request = sendTailnetAccessRequest(socket, enabled);
+	const result = await request.response;
+	if (!result.rebindRequired) return result;
+	const reconnectedSocket = await request.pending.reconnect;
+	if (!reconnectedSocket) throw new Error("Relay did not restart its listener.");
+	const confirmed = await sendTailnetAccessRequest(reconnectedSocket).response;
+	if (enabled !== undefined && confirmed.enabled !== enabled) {
+		return {
+			...confirmed,
+			ok: false,
+			error: confirmed.error ?? "The relay could not apply the requested Tailnet access state.",
+		};
+	}
+	return confirmed;
 }
 
 function rejectPendingTailnetRequests(error: Error): void {
@@ -155,6 +199,10 @@ function handleRelayMessage(socket: WebSocket, raw: string): void {
 		if (!pending) return;
 		pendingTailnetRequests.delete(message.requestId);
 		clearTimeout(pending.timer);
+		if (message.rebindRequired) {
+			pending.reconnect = waitForRelayReconnect(socket);
+			post({ t: "tailnetAccessAck", requestId: message.requestId });
+		}
 		pending.resolve(message);
 		return;
 	}
@@ -206,6 +254,12 @@ async function connect(): Promise<void> {
 			for (const waiter of relayOpenWaiters) {
 				clearTimeout(waiter.timer);
 				relayOpenWaiters.delete(waiter);
+				waiter.resolve(socket);
+			}
+			for (const waiter of relayReconnectWaiters) {
+				if (waiter.previous === socket) continue;
+				clearTimeout(waiter.timer);
+				relayReconnectWaiters.delete(waiter);
 				waiter.resolve(socket);
 			}
 			void ensureInstanceId()

@@ -98,9 +98,10 @@ type TailnetAccessResult = {
 	port: number;
 	tailnetAddresses: string[];
 	error?: string;
+	rebindRequired?: boolean;
 };
 
-async function requestTailnetAccess(
+async function receiveTailnetAccessResult(
 	ws: WebSocket,
 	request: { requestId: number; enabled?: boolean },
 ): Promise<TailnetAccessResult> {
@@ -135,6 +136,45 @@ async function requestTailnetAccess(
 	ws.addEventListener("error", onError, { once: true });
 	ws.send(JSON.stringify({ t: "tailnetAccessRequest", ...request }));
 	return promise;
+}
+
+async function waitForSocketClose(ws: WebSocket): Promise<void> {
+	if (ws.readyState === WebSocket.CLOSED) return;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	ws.addEventListener("close", () => resolve(), { once: true });
+	if ((ws.readyState as number) === WebSocket.CLOSED) resolve();
+	return promise;
+}
+
+async function reconnectExtension(port: number): Promise<WebSocket> {
+	const deadline = Date.now() + 2_000;
+	while (Date.now() < deadline) {
+		try {
+			return await connectExtension(port);
+		} catch {
+			// The server rebind follows the socket close; retrying bridges that brief listener gap.
+			await Bun.sleep(20);
+		}
+	}
+	throw new Error("Extension socket did not reconnect after listener rebind");
+}
+
+async function requestTailnetAccess(
+	ws: WebSocket,
+	request: { requestId: number; enabled?: boolean },
+): Promise<{ ws: WebSocket; result: TailnetAccessResult }> {
+	const result = await receiveTailnetAccessResult(ws, request);
+	if (request.enabled !== undefined && result.ok) expect(result.rebindRequired).toBeTrue();
+	if (!result.rebindRequired) return { ws, result };
+
+	const closed = waitForSocketClose(ws);
+	ws.send(JSON.stringify({ t: "tailnetAccessAck", requestId: request.requestId }));
+	await closed;
+
+	const reconnected = await reconnectExtension(result.port);
+	const confirmationRequestId = request.requestId + 10_000;
+	const confirmed = await receiveTailnetAccessResult(reconnected, { requestId: confirmationRequestId });
+	return { ws: reconnected, result: confirmed };
 }
 
 async function findNonTailnetResponse(port: number): Promise<{ address: string; status: number } | undefined> {
@@ -377,11 +417,13 @@ describe("browser relay discovery endpoint", () => {
 		expect(() => startRelayServer({ port: relay!.port })).toThrow();
 		expect((await fetch(`http://127.0.0.1:${relay.port}/json/version`)).status).toBe(503);
 	});
-	it("controls tailnet exposure through the extension socket without disturbing loopback readiness", async () => {
+	it("controls tailnet exposure through the extension socket and reconnects across listener rebinds", async () => {
 		const port = await startReadyRelay();
 		const base = `http://127.0.0.1:${port}`;
 
-		const queried = await requestTailnetAccess(extension!, { requestId: 101 });
+		const queriedResponse = await requestTailnetAccess(extension!, { requestId: 101 });
+		extension = queriedResponse.ws;
+		const queried = queriedResponse.result;
 		expect(queried).toMatchObject({
 			t: "tailnetAccessResult",
 			requestId: 101,
@@ -389,19 +431,23 @@ describe("browser relay discovery endpoint", () => {
 			enabled: false,
 			port,
 		});
+		expect(queried.rebindRequired).not.toBeTrue();
 		expect(Array.isArray(queried.tailnetAddresses)).toBeTrue();
 		expect(queried.tailnetAddresses.every(address => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address))).toBeTrue();
 
-		const enabled = await requestTailnetAccess(extension!, { requestId: 102, enabled: true });
+		const enabledResponse = await requestTailnetAccess(extension!, { requestId: 102, enabled: true });
+		extension = enabledResponse.ws;
+		const enabled = enabledResponse.result;
 		expect(enabled).toMatchObject({
 			t: "tailnetAccessResult",
-			requestId: 102,
+			requestId: 10_102,
 			ok: true,
 			enabled: true,
 			port,
 			tailnetAddresses: queried.tailnetAddresses,
 		});
-		const tailnetAddress = queried.tailnetAddresses[0];
+		expect(enabled.rebindRequired).not.toBeTrue();
+		const tailnetAddress = queried.tailnetAddresses.find(address => address.startsWith("100."));
 		if (tailnetAddress !== undefined) {
 			const remoteResponse = await fetch(`http://${tailnetAddress}:${port}/json/version`, {
 				signal: AbortSignal.timeout(1_500),
@@ -419,15 +465,18 @@ describe("browser relay discovery endpoint", () => {
 		const readyWhileEnabled = await (await fetch(`${base}/capabilities`)).json();
 		expect(readyWhileEnabled.backend).toMatchObject({ ready: true, extensionSeen: true });
 
-		const disabled = await requestTailnetAccess(extension!, { requestId: 103, enabled: false });
+		const disabledResponse = await requestTailnetAccess(extension!, { requestId: 103, enabled: false });
+		extension = disabledResponse.ws;
+		const disabled = disabledResponse.result;
 		expect(disabled).toMatchObject({
 			t: "tailnetAccessResult",
-			requestId: 103,
+			requestId: 10_103,
 			ok: true,
 			enabled: false,
 			port,
 			tailnetAddresses: queried.tailnetAddresses,
 		});
+		expect(disabled.rebindRequired).not.toBeTrue();
 		if (tailnetAddress !== undefined) {
 			const remoteUnavailable = await fetch(`http://${tailnetAddress}:${port}/json/version`, {
 				signal: AbortSignal.timeout(1_500),
