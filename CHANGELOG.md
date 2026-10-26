@@ -29,6 +29,7 @@
 - Restricted attach-failure diagnostics to allowlisted operation and target metadata, excluding page URLs and arbitrary error text.
 - Allowed target-scoped `Network.enable` commands to bypass the serialized view queue, preventing a stalled page operation from consuming the client's extension-RPC deadline.
 - Normalized media subprocess output to a byte view in original-client recording acceptance, preserving full-frame decode and visible color-state checks.
+- Excluded local agent session state and environment files from Git, and stripped Unix owner/group metadata from extension ZIP releases.
 
 ### Native Focus Policy
 

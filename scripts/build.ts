@@ -24,7 +24,7 @@ await fs.cp(path.join(root, "skills", "omp-browser-relay"), path.join(dist, "ski
 });
 await fs.chmod(path.join(dist, "cli.js"), 0o755);
 
-const zip = await $`zip -qr ../omp-browser-relay-extension.zip .`.cwd(extension).quiet().nothrow();
+const zip = await $`zip -Xqr ../omp-browser-relay-extension.zip .`.cwd(extension).quiet().nothrow();
 if (zip.exitCode !== 0) throw new Error(`Could not package extension: ${zip.stderr.toString()}`);
 console.log(`Built ${path.join(dist, "cli.js")}`);
 console.log(`Built ${extension}`);

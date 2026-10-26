@@ -100,6 +100,13 @@ Browser/system permissions, native file/authentication dialogs, and sites or eva
 
 Moving a page out revokes future relay commands; already-dispatched JavaScript, timers or network requests cannot be rolled back. Stock clients own retry/cleanup bookkeeping and disconnect wording. Chrome-restricted pages and other debugger attachments can make access fail; the relay does not substitute another page or synthesize success.
 
+## Release privacy
+
+- Local agent/session state (`.mesh/`) and `.env` files are ignored by Git; `.env.example` must contain placeholders only. Ignore rules do not remove files or identities already recorded in Git history.
+- npm uses the `package.json` file allowlist. `prepack` rebuilds `dist/` from scratch; bundles omit source maps and the extension ZIP omits Unix owner/group metadata. Do not add browser profiles, captures, logs, or credentials to the allowlisted directories.
+- Before publishing Git refs, review author/committer names and email addresses as well as file contents. Use a privacy-safe Git identity for new commits; changing existing commit identities requires an explicit history rewrite.
+- Before release, run `bun run build` and `npm pack --dry-run --ignore-scripts` and inspect the listed files and extension ZIP, not just the working tree.
+
 ## Development and verification
 
 ```sh
