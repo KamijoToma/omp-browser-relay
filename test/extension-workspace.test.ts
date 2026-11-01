@@ -760,6 +760,24 @@ describe("shared-control workspace", () => {
 		await pending;
 	});
 
+	test("Network.enable dispatches without waiting on another tab's capture", async () => {
+		const h = harness(),
+			a = await create(h.workspace),
+			b = await create(h.workspace);
+		await h.workspace.runRpc({ op: "attach", tabId: a.tabId });
+		await h.workspace.runRpc({ op: "attach", tabId: b.tabId });
+		const blocked = blockCommand(h.api, "Page.captureScreenshot"),
+			capture = h.workspace.runRpc({ op: "send", tabId: a.tabId, method: "Page.captureScreenshot" });
+		await blocked.entered;
+		const network = h.workspace.runRpc({ op: "send", tabId: b.tabId, method: "Network.enable" });
+		await settle();
+		expect(h.dispatches.some(command => command.tabId === b.tabId && command.method === "Network.enable")).toBe(true);
+		expect(h.tabs.get(a.tabId)?.active).toBe(true);
+		expect(h.tabs.get(b.tabId)?.active).toBe(false);
+		blocked.finish();
+		await Promise.all([capture, network]);
+	});
+
 	test("capture selection is serialized, while cleanup can bypass a blocked capture", async () => {
 		const h = harness(),
 			a = await create(h.workspace),

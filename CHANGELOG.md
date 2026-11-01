@@ -27,6 +27,7 @@
 - Revalidated child-session destinations and detach parameters after asynchronous selection or ownership checks, before native dispatch.
 - Fenced delayed debugger events by attachment generation so stale events cannot alter a replacement attachment's child sessions.
 - Restricted attach-failure diagnostics to allowlisted operation and target metadata, excluding page URLs and arbitrary error text.
+- Allowed target-scoped `Network.enable` commands to bypass the serialized view queue, preventing a stalled page operation from consuming the client's extension-RPC deadline.
 - Normalized media subprocess output to a byte view in original-client recording acceptance, preserving full-frame decode and visible color-state checks.
 
 ### Native Focus Policy

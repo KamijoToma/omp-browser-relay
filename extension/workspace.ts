@@ -515,9 +515,11 @@ export class Workspace {
 			await this.#detach(msg.tabId);
 			return {};
 		}
+		// Network.enable is target-scoped; do not queue it behind a stalled view operation.
 		if (
 			msg.op === "send" &&
-			(isWorkspaceCleanupCommand(msg.method, msg.params) ||
+			(msg.method === "Network.enable" ||
+				isWorkspaceCleanupCommand(msg.method, msg.params) ||
 				msg.method === "Page.handleJavaScriptDialog" ||
 				msg.method === "Emulation.setFocusEmulationEnabled")
 		) {
