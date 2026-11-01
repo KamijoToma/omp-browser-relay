@@ -330,7 +330,10 @@ try {
 		const box = canvas.getBoundingClientRect();
 		return { x: box.left + canvas.clientLeft, y: box.top + canvas.clientTop };
 	});
-	// Establish user A's own state before automation. Window activation during agent input is explicitly allowed.
+	// Activate before setting DOM focus; native window activation can reset the focused element.
+	if (nativeInput) {
+		await $`${xdotool} windowactivate --sync ${nativeUserWindow!}`.quiet();
+	}
 	await extension.evaluate(async id => {
 		await chrome.debugger.attach({ tabId: id }, "1.3");
 		await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
@@ -339,7 +342,6 @@ try {
 	}, userId);
 	try {
 		if (nativeInput) {
-			await $`${xdotool} windowactivate --sync ${nativeUserWindow!}`.quiet();
 			await $`${xdotool} type --clearmodifiers --delay 15 ${"USER_INPUT_ONLY"}`.quiet();
 		} else {
 			await extension.evaluate(async id => {
