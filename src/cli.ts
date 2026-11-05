@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { version } from "../package.json";
 import { startRelayServer } from "./server";
 
-const HELP = `Usage: omp-browser-relay [serve] [--host <hostname>] [--port <port>] [--token <secret>] [--verbose]
+const HELP = `Usage: omp-browser-relay [serve] [--host <hostname>] [--port <port>] [--token <secret>] [--suppress-beforeunload] [--verbose]
        omp-browser-relay install [--dir <directory>]
        omp-browser-relay install-skill [--dir <directory>]
        omp-browser-relay --help | --version
@@ -23,6 +23,10 @@ Options:
   --host     Advanced listener hostname (default: 127.0.0.1; 0.0.0.0 enables Tailnet source filtering)
   -p, --port  Listening port (default: 9224; 0 chooses an available port)
   --token     Require this shared secret on the extension WebSocket endpoint
+  --suppress-beforeunload
+              Stop pages in attached tabs from registering beforeunload handlers, so navigating
+              away never raises Chrome's "Leave site?" prompt (which activates the window and
+              steals focus). Also removes unsaved-changes warnings in the workspace window.
   --verbose   Log relay activity
   --dir       Install destination (extension: ~/.omp-browser-relay/extension;
               skill: ~/.agents/skills/omp-browser-relay)
@@ -34,6 +38,7 @@ interface CliOptions {
 	hostname: string;
 	port: number;
 	token?: string;
+	suppressBeforeUnload: boolean;
 	verbose: boolean;
 	dir?: string;
 	help: boolean;
@@ -45,6 +50,7 @@ function parseArgs(argv: string[]): CliOptions {
 		action: "serve",
 		hostname: "127.0.0.1",
 		port: 9224,
+		suppressBeforeUnload: false,
 		verbose: false,
 		help: false,
 		showVersion: false,
@@ -77,6 +83,7 @@ function parseArgs(argv: string[]): CliOptions {
 		}
 		if (inline !== undefined) throw new Error(`Unknown argument: ${argument}`);
 		if (flag === "--verbose") options.verbose = true;
+		else if (flag === "--suppress-beforeunload") options.suppressBeforeUnload = true;
 		else if (flag === "--help" || flag === "-h") options.help = true;
 		else if (flag === "--version") options.showVersion = true;
 		else throw new Error(`Unknown argument: ${argument}`);
@@ -84,8 +91,11 @@ function parseArgs(argv: string[]): CliOptions {
 	if (options.action === "serve" && options.dir !== undefined) {
 		throw new Error("--dir is only valid for install or install-skill");
 	}
-	if (options.action !== "serve" && (portProvided || hostProvided || options.token !== undefined || options.verbose)) {
-		throw new Error("--host, --port, --token and --verbose are only valid for serve");
+	if (
+		options.action !== "serve" &&
+		(portProvided || hostProvided || options.token !== undefined || options.suppressBeforeUnload || options.verbose)
+	) {
+		throw new Error("--host, --port, --token, --suppress-beforeunload and --verbose are only valid for serve");
 	}
 	return options;
 }
@@ -150,6 +160,7 @@ async function main(): Promise<void> {
 		hostname: options.hostname,
 		port: options.port,
 		token: options.token,
+		suppressBeforeUnload: options.suppressBeforeUnload,
 		log: options.verbose ? (message, data) => console.error(`[relay] ${message}`, data ?? "") : undefined,
 	});
 	const urlHost = options.hostname.includes(":") ? `[${options.hostname}]` : options.hostname;

@@ -17,6 +17,7 @@
 - Added framework-free interaction acceptance scenarios to the modern and legacy original-client drivers.
 
 - Added configurable relay bind hostname with a loopback default and Tailscale/firewall guidance for remote CDP access.
+- Added an opt-in `--suppress-beforeunload` serve option that installs a page script on attached tabs so `beforeunload` handlers are never registered, preventing Chrome's focus-stealing "Leave site?" prompt when automation navigates away from editors or forms. It is reported as `pageIntervention.suppressBeforeUnload` in `/capabilities`, off by default, and does not change `backgroundNativeFocusIsolation`.
 - Added an extension-options Tailscale access toggle that live-rebinds the relay's single listening socket without restarting the process, briefly reconnects the local extension, and provides a copyable remote TUI command with clipboard-write permission.
 
 ### Fixed

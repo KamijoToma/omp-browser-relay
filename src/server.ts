@@ -33,6 +33,12 @@ export interface RelayServerOptions {
 	hostname?: string;
 	/** Shared secret the extension must present as `?token=`; unset disables the check. */
 	token?: string;
+	/**
+	 * Stop pages in attached tabs from registering `beforeunload` handlers. Leaving a page that has
+	 * one makes Chrome raise a prompt, which activates the workspace window and steals native focus.
+	 * Off by default because it also removes "unsaved changes" warnings for people using the window.
+	 */
+	suppressBeforeUnload?: boolean;
 	log?: (message: string, data?: Record<string, unknown>) => void;
 }
 
@@ -87,7 +93,7 @@ function getTailnetIpv4Addresses(): string[] {
 export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const log = opts.log ?? (() => {});
 	let hostname = opts.hostname ?? "127.0.0.1";
-	const bridge = new RelayBridge({ log });
+	const bridge = new RelayBridge({ log, suppressBeforeUnload: opts.suppressBeforeUnload });
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
 	let tailnetAccessEnabled = hostname === "0.0.0.0";
@@ -141,7 +147,11 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 					return new Response("websocket upgrade required", { status: 426 });
 				}
 				if (req.method !== "GET") return new Response("Method not allowed", { status: 405 });
-				if (path === "/capabilities") return Response.json(relayCapabilities(bridge.ready, bridge.extensionSeen));
+				if (path === "/capabilities") {
+					return Response.json(
+						relayCapabilities(bridge.ready, bridge.extensionSeen, bridge.suppressesBeforeUnload),
+					);
+				}
 				if (path === "/docs") {
 					return new Response(RELAY_REFERENCE, { headers: { "Content-Type": "text/markdown; charset=utf-8" } });
 				}

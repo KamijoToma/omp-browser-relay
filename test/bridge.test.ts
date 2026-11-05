@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { RelayBridge, type RelaySocket } from "../src/bridge";
+import { SUPPRESS_BEFORE_UNLOAD_SOURCE } from "../src/beforeunload";
 import type { RelayRpcRequest, RelayToExtMessage, TabSnapshot } from "../src/protocol";
 
 /** Same derivation as the bridge: target ids embed this per-instance code. */
@@ -1933,5 +1934,151 @@ describe("relay initialization interruptions", () => {
 		ack(bridge, ext, "attach");
 		await flush();
 		expect(cdp.attachedSessions()).toHaveLength(1);
+	});
+});
+
+describe("RelayBridge beforeunload suppression", () => {
+	const GUARD = "Page.addScriptToEvaluateOnNewDocument";
+
+	/** The guard adds a promise hop per attach; give the whole chain time to settle. */
+	async function settle(): Promise<void> {
+		for (let i = 0; i < 4; i++) await flush();
+	}
+
+	/** Ask the bridge to attach tab 1's page target and return the downstream command id. */
+	function requestAttach(bridge: RelayBridge, connId: number): number {
+		const id = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id,
+				method: "Target.attachToTarget",
+				params: { targetId: `PAGE${ANON}.1`, flatten: true },
+			}),
+		);
+		return id;
+	}
+
+	function guards(ext: FakeExtSocket): Array<ExtRpc<"send">> {
+		return ext.rpcs("send").filter(rpc => rpc.method === GUARD);
+	}
+
+	it("is off by default and attaches without sending any script", async () => {
+		const bridge = new RelayBridge();
+		expect(bridge.suppressesBeforeUnload).toBe(false);
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const attachId = requestAttach(bridge, connId);
+		ack(bridge, ext, "attach");
+		await settle();
+		expect(cdp.sessionFor(attachId)).toBeDefined();
+		expect(ext.rpcs("send")).toEqual([]);
+	});
+
+	it("registers the script before advertising the attachment", async () => {
+		const bridge = new RelayBridge({ suppressBeforeUnload: true });
+		expect(bridge.suppressesBeforeUnload).toBe(true);
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const attachId = requestAttach(bridge, connId);
+		ack(bridge, ext, "attach");
+		await settle();
+
+		const [guard] = guards(ext);
+		expect(guards(ext)).toHaveLength(1);
+		expect(guard?.tabId).toBe(1);
+		expect(guard?.sessionId).toBeUndefined();
+		expect(guard?.params).toEqual({ source: SUPPRESS_BEFORE_UNLOAD_SOURCE });
+		// No client command may run, and no session exists, until the script is registered.
+		expect(cdp.sessionFor(attachId)).toBeUndefined();
+
+		ack(bridge, ext, "send");
+		await settle();
+		expect(cdp.sessionFor(attachId)).toBeDefined();
+		expect(guards(ext)).toHaveLength(1);
+	});
+
+	it("registers again after a detach and reattach, since Chrome drops scripts with the debugger session", async () => {
+		const bridge = new RelayBridge({ suppressBeforeUnload: true });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const first = requestAttach(bridge, connId);
+		ack(bridge, ext, "attach");
+		await settle();
+		ack(bridge, ext, "send");
+		await settle();
+		const sessionId = cdp.sessionFor(first)!;
+
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId } }),
+		);
+		bridge.extMessage(
+			ext,
+			JSON.stringify({ t: "detached", tabId: 1, reason: "target_closed", relayInitiated: true }),
+		);
+		ack(bridge, ext, "detach");
+		await settle();
+
+		const second = requestAttach(bridge, connId);
+		ack(bridge, ext, "attach");
+		await settle();
+		expect(guards(ext)).toHaveLength(2);
+		ack(bridge, ext, "send");
+		await settle();
+		expect(cdp.sessionFor(second)).toBeDefined();
+	});
+
+	it("still attaches when registration fails, logging only allowlisted metadata", async () => {
+		const logs: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const bridge = new RelayBridge({
+			suppressBeforeUnload: true,
+			log: (message, data) => logs.push({ message, data }),
+		});
+		const secretUrl = "https://user:hunter2@private.example/secret?token=abc#frag";
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1, url: secretUrl })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const attachId = requestAttach(bridge, connId);
+		ack(bridge, ext, "attach");
+		await settle();
+		nack(bridge, ext, "send", `Cannot inject into ${secretUrl}`);
+		await settle();
+
+		expect(cdp.sessionFor(attachId)).toBeDefined();
+		expect(logs.filter(entry => entry.message === "beforeunload guard failed")).toEqual([
+			{
+				message: "beforeunload guard failed",
+				data: { tabKey: `${ANON}:1`, operation: "suppressBeforeUnload", failure: "install_failed" },
+			},
+		]);
+		const emitted = JSON.stringify(logs);
+		for (const canary of ["hunter2", "private.example", "token=abc", "frag", "Cannot inject"]) {
+			expect(emitted).not.toContain(canary);
+		}
+	});
+
+	it("does not advertise a tab that was discarded while the script was being registered", async () => {
+		const bridge = new RelayBridge({ suppressBeforeUnload: true });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const attachId = requestAttach(bridge, connId);
+		ack(bridge, ext, "attach");
+		await settle();
+		expect(guards(ext)).toHaveLength(1);
+
+		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 1, discarded: true }) }));
+		ack(bridge, ext, "send");
+		await settle();
+		expect(cdp.sessionFor(attachId)).toBeUndefined();
 	});
 });

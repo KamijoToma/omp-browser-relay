@@ -268,6 +268,21 @@ describe("browser relay discovery endpoint", () => {
 		expect((await fetch(`${base}/json/version`)).status).toBe(503);
 	});
 
+	it("discloses whether beforeunload suppression is enabled, defaulting to off", async () => {
+		relay = startRelayServer({ port: 0 });
+		let capabilities = await (await fetch(`http://127.0.0.1:${relay.port}/capabilities`)).json();
+		expect(capabilities.pageIntervention).toEqual({ suppressBeforeUnload: false });
+		expect(relay.bridge.suppressesBeforeUnload).toBe(false);
+		relay.stop();
+
+		relay = startRelayServer({ port: 0, suppressBeforeUnload: true });
+		capabilities = await (await fetch(`http://127.0.0.1:${relay.port}/capabilities`)).json();
+		expect(capabilities.pageIntervention).toEqual({ suppressBeforeUnload: true });
+		expect(relay.bridge.suppressesBeforeUnload).toBe(true);
+		// The opt-in changes page behavior only; native-focus isolation is still not promised.
+		expect(capabilities.boundaries.backgroundNativeFocusIsolation).toBe(false);
+	});
+
 	it("reports live readiness separately from supported capabilities", async () => {
 		const port = await startReadyRelay();
 		const base = `http://127.0.0.1:${port}`;

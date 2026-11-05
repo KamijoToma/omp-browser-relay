@@ -24,6 +24,7 @@
  */
 import { createHash } from "node:crypto";
 import { version } from "../package.json";
+import { SUPPRESS_BEFORE_UNLOAD_SOURCE } from "./beforeunload";
 import {
 	DISCARDED_TABS_PROTOCOL_VERSION,
 	isWorkspaceCleanupCommand,
@@ -261,13 +262,22 @@ export class RelayBridge {
 	/** Downstream child session id → browser-scoped Chrome session and tab. */
 	#realSessionTabs = new Map<string, { tabKey: string; sessionId: string }>();
 	#log: (message: string, data?: Record<string, unknown>) => void;
+	#suppressBeforeUnload: boolean;
 
 	constructor(
 		opts: {
 			log?: (message: string, data?: Record<string, unknown>) => void;
+			/** Install a page script on attached tabs that stops `beforeunload` prompts from stealing focus. */
+			suppressBeforeUnload?: boolean;
 		} = {},
 	) {
 		this.#log = opts.log ?? (() => {});
+		this.#suppressBeforeUnload = opts.suppressBeforeUnload ?? false;
+	}
+
+	/** True when attached tabs get the `beforeunload`-suppression script. */
+	get suppressesBeforeUnload(): boolean {
+		return this.#suppressBeforeUnload;
 	}
 
 	/** True once the extension has completed its hello handshake. */
@@ -1363,10 +1373,18 @@ export class RelayBridge {
 		}
 		const attempt = this.#rpc({ op: "attach", tabId: tab.tabId }, inst)
 			.then(() => {
-				if (tab.discarded || !this.#eligible(tab) || this.#tabs.get(tab.tabKey) !== tab) return false;
-				tab.attached = true;
-				tab.reattachedAfterDetach = true;
-				return true;
+				const usable = (): boolean => !tab.discarded && this.#eligible(tab) && this.#tabs.get(tab.tabKey) === tab;
+				const markAttached = (): boolean => {
+					if (!usable()) return false;
+					tab.attached = true;
+					tab.reattachedAfterDetach = true;
+					return true;
+				};
+				if (!this.#suppressBeforeUnload) return markAttached();
+				// Register before the tab is advertised as attached so no client command can navigate first.
+				// Kept on a separate promise chain so the default path stays synchronous.
+				if (!usable()) return false;
+				return this.#installBeforeUnloadGuard(tab, inst).then(markAttached);
 			})
 			.catch(err => {
 				// Keep attach diagnostics allowlisted: URLs and extension errors can contain page secrets.
@@ -1383,6 +1401,30 @@ export class RelayBridge {
 			});
 		tab.attaching = attempt;
 		return await attempt;
+	}
+
+	/**
+	 * Best effort: the guard only removes a focus-stealing native prompt, so a failure must not
+	 * prevent the attachment. Diagnostics stay allowlisted (no URLs or arbitrary error text).
+	 */
+	async #installBeforeUnloadGuard(tab: TabState, inst: ExtInstance): Promise<void> {
+		try {
+			await this.#rpc(
+				{
+					op: "send",
+					tabId: tab.tabId,
+					method: "Page.addScriptToEvaluateOnNewDocument",
+					params: { source: SUPPRESS_BEFORE_UNLOAD_SOURCE },
+				},
+				inst,
+			);
+		} catch (err) {
+			this.#log("beforeunload guard failed", {
+				tabKey: tab.tabKey,
+				operation: "suppressBeforeUnload",
+				failure: err instanceof ExtensionReplacedError ? "extension_replaced" : "install_failed",
+			});
+		}
 	}
 
 	#eligible(tab: TabState): boolean {

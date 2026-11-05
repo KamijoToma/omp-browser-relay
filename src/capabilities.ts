@@ -5,7 +5,7 @@ import { RELAY_CAPABILITIES } from "./protocol";
 /** The installed skill and HTTP discovery serve this same canonical reference. */
 export const RELAY_REFERENCE = reference;
 
-export function relayCapabilities(ready: boolean, extensionSeen: boolean) {
+export function relayCapabilities(ready: boolean, extensionSeen: boolean, suppressBeforeUnload = false) {
 	return {
 		schemaVersion: 1,
 		package: { name: "omp-browser-relay", version },
@@ -36,5 +36,8 @@ export function relayCapabilities(ready: boolean, extensionSeen: boolean) {
 			captchaPassGuaranteed: false,
 			nativeIsolationVerification: "activation-observed-on-tested-chrome-150-x11-and-kwin-wayland",
 		},
+		// Opt-in (`--suppress-beforeunload`): pages in newly attached tabs cannot register `beforeunload`
+		// handlers, so leaving them never raises Chrome's focus-stealing "Leave site?" prompt.
+		pageIntervention: { suppressBeforeUnload },
 	};
 }

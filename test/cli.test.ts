@@ -51,6 +51,9 @@ describe("standalone relay CLI", () => {
 			["install-skill", "--dir"],
 			["install-skill", "--token", "secret"],
 			["install-skill", "--verbose"],
+			["install", "--suppress-beforeunload"],
+			["install-skill", "--suppress-beforeunload"],
+			["--suppress-beforeunload=yes"],
 		]) {
 			const result = await invoke(...args);
 			expect(result.code).toBe(1);
@@ -102,6 +105,38 @@ describe("standalone relay CLI", () => {
 			await child.exited;
 		}
 	});
+	it("documents --suppress-beforeunload in the help text", async () => {
+		const result = await invoke("--help");
+		expect(result.code).toBe(0);
+		expect(result.stdout).toContain("--suppress-beforeunload");
+	});
+
+	it("enables beforeunload suppression only when asked, and reports it through discovery", async () => {
+		for (const [args, expected] of [
+			[["--port=0"], false],
+			[["--port=0", "--suppress-beforeunload"], true],
+		] as const) {
+			const child = Bun.spawn([process.execPath, CLI, ...args], { stdout: "pipe", stderr: "pipe" });
+			const reader = child.stdout.getReader();
+			try {
+				let output = "";
+				let match: RegExpExecArray | null = null;
+				while (!match) {
+					const chunk = await reader.read();
+					if (chunk.done) throw new Error("CLI exited without its readiness banner");
+					output += new TextDecoder().decode(chunk.value);
+					match = /browser relay listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(output);
+				}
+				const capabilities = await (await fetch(`http://127.0.0.1:${match[1]}/capabilities`)).json();
+				expect(capabilities.pageIntervention).toEqual({ suppressBeforeUnload: expected });
+			} finally {
+				reader.releaseLock();
+				child.kill("SIGTERM");
+				await child.exited;
+			}
+		}
+	});
+
 	it("binds the CLI to a non-loopback host while serving discovery through loopback", async () => {
 		const child = Bun.spawn([process.execPath, CLI, "--host", "0.0.0.0", "--port", "0"], {
 			stdout: "pipe",
