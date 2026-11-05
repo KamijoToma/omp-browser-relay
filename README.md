@@ -58,6 +58,43 @@ Alternatively, opt in per call with `browser.open({ app: { relay: true }, url: "
 
 In omp 18.12.2, ordinary `browser.open()` creates a new work page in the dedicated window. Version 18.4.2 only adopts existing pages: first click **Create background work tab** in this extension's options. That button creates a blank workspace page. Old clients also lack `browser.targets()` and owned relay-page creation/close semantics; the extension cannot add missing frontend APIs. An explicit `app.target` uses the client's URL/title matcher, not a CDP target id.
 
+### Stop navigation prompts from stealing focus (`--suppress-beforeunload`)
+
+**Problem.** When automation navigates or reloads a page that registered a `beforeunload` handler (editors, forms with unsaved changes), Chrome raises its "Leave site?" prompt. Chrome has to bring the tab and its window to the foreground to show that prompt, so it can un-minimize the workspace and take native focus; the client's automatic acceptance of the dialog only happens afterwards. The relay cannot stop that activation once the prompt exists.
+
+**What the flag does.** `--suppress-beforeunload` makes the relay register a small page script (`Page.addScriptToEvaluateOnNewDocument`) on every tab it attaches. The script discards `beforeunload` listeners and neutralizes `window.onbeforeunload`, so the prompt is never raised and nothing is activated. The script is registered before the tab is advertised as attached, so no client command can navigate first; if registration fails it is logged (without URLs or page text) and the tab still attaches.
+
+```sh
+omp-browser-relay serve --port 9333 --suppress-beforeunload
+```
+
+Under launchd, add it to the job's `ProgramArguments`, then reload the job. `launchctl kickstart` reuses the already-loaded definition, so use `bootout` and `bootstrap` for the change to take effect:
+
+```xml
+<array>
+	<string>/path/to/bun</string>
+	<string>/path/to/omp-browser-relay/dist/cli.js</string>
+	<string>serve</string>
+	<string>--port</string>
+	<string>9333</string>
+	<string>--suppress-beforeunload</string>
+</array>
+```
+
+```sh
+launchctl bootout gui/$(id -u)/<label>
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+```
+
+**Verify.** `GET /capabilities` reports `pageIntervention.suppressBeforeUnload` (`true` when enabled). It is a page-behavior switch only: `boundaries.backgroundNativeFocusIsolation` stays `false`, and mouse input, page-initiated window/focus requests and native dialogs can still activate the window.
+
+**Trade-offs and limits.**
+
+- Off by default, because it also removes unsaved-changes warnings for people using the workspace window: closing a tab with an unsaved form no longer asks first.
+- It applies to documents created after a tab is attached. Handlers a page registered earlier survive until its next navigation, so reload long-open pages once after (re)starting the relay.
+- An inline `<body onbeforeunload>` attribute is not intercepted.
+- Only the CLI flag controls it; the extension does not need reloading or reconfiguring.
+
 ## Discover capabilities and install the skill
 
 ```sh
@@ -83,7 +120,7 @@ When upgrading from 0.1, update both the service and extension, reload it in Chr
 - User focus does not pause automation. Users and agents can interact with the same workspace; clicks, input, navigation and selection within it can conflict.
 - Input uses the page's real CDP mouse/keyboard path, not OS input injection or synthetic DOM clicks. Actual focus emulation remains disabled, including when stock clients request it.
 - The service does not directly activate a native window or restore focus after an activation. **Chrome can nevertheless activate the window during ordinary trusted mouse input**; this is permitted by the shared-control policy and disclosed in the skill and capability response.
-- Navigating away from a page that registered a `beforeunload` handler makes Chrome raise a "Leave site?" prompt, which also activates the window. Start the relay with `--suppress-beforeunload` to stop pages in attached tabs from registering those handlers (off by default: it also removes unsaved-changes warnings for people using the workspace window). `/capabilities` reports it as `pageIntervention.suppressBeforeUnload`.
+- Navigating away from a page that registered a `beforeunload` handler raises Chrome's "Leave site?" prompt, which also activates the window. The opt-in `--suppress-beforeunload` flag prevents that; see [Stop navigation prompts from stealing focus](#stop-navigation-prompts-from-stealing-focus---suppress-beforeunload).
 - Captures return the actual business page and do not restore another tab after completion. A user's intervening selection is not undone by a late screenshot.
 - Closing a workspace invalidates its targets. Closing its last business tab can retire the window before the close RPC is acknowledged; the successful removal acknowledgement is preserved.
 - Workspace identity and attachments persist in Chrome session storage, not window titles. Browser-run identity protects against stale target IDs after browser restart.
