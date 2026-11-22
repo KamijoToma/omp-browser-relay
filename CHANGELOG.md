@@ -29,6 +29,7 @@
 - Fenced delayed debugger events by attachment generation so stale events cannot alter a replacement attachment's child sessions.
 - Restricted attach-failure diagnostics to allowlisted operation and target metadata, excluding page URLs and arbitrary error text.
 - Allowed target-scoped `Network.enable` commands to bypass the serialized view queue, preventing a stalled page operation from consuming the client's extension-RPC deadline.
+- Closed the extension socket after two consecutive extension-RPC deadlines with no answer in between, so a CDP command that never returns (which holds the extension's serialized view lock and times out every later RPC while the WebSocket stays healthy) is recovered by the extension's normal reconnect instead of a relay restart. Any result, even a late or failed one, resets the count, and the RPCs a reset interrupts are retryable rather than banning their tabs. Added a `rpcTimeoutMs` bridge option (default 20s) for tests.
 - Normalized media subprocess output to a byte view in original-client recording acceptance, preserving full-frame decode and visible color-state checks.
 - Excluded local agent session state and environment files from Git, and stripped Unix owner/group metadata from extension ZIP releases.
 

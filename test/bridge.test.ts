@@ -2082,3 +2082,95 @@ describe("RelayBridge beforeunload suppression", () => {
 		expect(cdp.sessionFor(attachId)).toBeUndefined();
 	});
 });
+
+describe("RelayBridge unresponsive extension", () => {
+	const TIMEOUT_MS = 20;
+
+	/** Ask for a page attach: one extension `attach` RPC for `tabId`, no answer unless the test acks it. */
+	function startAttach(bridge: RelayBridge, connId: number, tabId: number): void {
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.attachToTarget",
+				params: { targetId: `PAGE${ANON}.${tabId}`, flatten: true },
+			}),
+		);
+	}
+
+	function setup(tabCount = 3) {
+		const bridge = new RelayBridge({ rpcTimeoutMs: TIMEOUT_MS });
+		const ext = new FakeExtSocket();
+		connect(
+			bridge,
+			ext,
+			Array.from({ length: tabCount }, (_, index) => tab({ tabId: index + 1 })),
+		);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		return { bridge, ext, connId };
+	}
+
+	it("drops the extension socket after consecutive RPC deadlines pass with no answer", async () => {
+		const { bridge, ext, connId } = setup();
+		startAttach(bridge, connId, 1);
+		startAttach(bridge, connId, 2);
+		startAttach(bridge, connId, 3);
+		await Bun.sleep(TIMEOUT_MS * 4);
+
+		expect(ext.closed).toBe(true);
+		expect(bridge.ready).toBe(false);
+		expect(bridge.extensionSeen).toBe(true);
+	});
+
+	it("keeps the tabs a reset interrupted retryable once the extension reconnects", async () => {
+		const { bridge, ext, connId } = setup();
+		startAttach(bridge, connId, 1);
+		startAttach(bridge, connId, 2); // second missed deadline: triggers the reset
+		startAttach(bridge, connId, 3); // still in flight when the reset happens
+		await Bun.sleep(TIMEOUT_MS * 4);
+		expect(ext.closed).toBe(true);
+
+		const replacement = new FakeExtSocket();
+		connect(bridge, replacement, [tab({ tabId: 2 }), tab({ tabId: 3 })]);
+		expect(bridge.ready).toBe(true);
+		startAttach(bridge, connId, 2);
+		startAttach(bridge, connId, 3);
+		expect(replacement.pending("attach").map(rpc => rpc.tabId)).toEqual([2, 3]);
+	});
+
+	it("keeps the socket after a single missed deadline", async () => {
+		const { bridge, ext, connId } = setup();
+		startAttach(bridge, connId, 1);
+		await Bun.sleep(TIMEOUT_MS * 4);
+
+		expect(ext.closed).toBe(false);
+		expect(bridge.ready).toBe(true);
+	});
+
+	it("resets the count when the extension answers an RPC in between", async () => {
+		const { bridge, ext, connId } = setup();
+		startAttach(bridge, connId, 1);
+		await Bun.sleep(TIMEOUT_MS * 2);
+		startAttach(bridge, connId, 2);
+		ack(bridge, ext, "attach");
+		await flush();
+		startAttach(bridge, connId, 3);
+		await Bun.sleep(TIMEOUT_MS * 4);
+
+		expect(ext.closed).toBe(false);
+		expect(bridge.ready).toBe(true);
+	});
+
+	it("treats a late result for an expired RPC as proof of life", async () => {
+		const { bridge, ext, connId } = setup();
+		startAttach(bridge, connId, 1);
+		const [expired] = ext.pending("attach");
+		await Bun.sleep(TIMEOUT_MS * 2);
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: expired!.id, ok: true, result: {} }));
+		startAttach(bridge, connId, 2);
+		await Bun.sleep(TIMEOUT_MS * 4);
+
+		expect(ext.closed).toBe(false);
+		expect(bridge.ready).toBe(true);
+	});
+});

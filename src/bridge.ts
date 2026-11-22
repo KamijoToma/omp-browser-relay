@@ -118,6 +118,8 @@ interface ExtInstance {
 	socket: RelaySocket | null;
 	info: { userAgent: string; browserVersion: string } | null;
 	workspaceWindowId: number | null;
+	/** RPC deadlines missed since the extension last answered anything; reset by any rpcResult or a new socket. */
+	consecutiveRpcTimeouts: number;
 }
 
 /** Deterministic per-instance code for target ids: stable across relay restarts. */
@@ -226,6 +228,12 @@ class TabState {
 const INELIGIBLE_URL = /^(chrome|devtools|edge|view-source|chrome-extension|chrome-untrusted|chrome-search):/i;
 
 const RPC_TIMEOUT_MS = 20_000;
+/**
+ * Unanswered RPCs in a row before the extension socket is dropped. The extension serializes most RPCs behind
+ * one view lock, so a single CDP command that never returns makes every later RPC time out while the
+ * WebSocket (and its keepalive pings) stays healthy. Reconnecting releases that lock.
+ */
+const WEDGED_RPC_TIMEOUTS = 2;
 const BROWSER_TARGET_ID = "relay-browser";
 const CDP_ERROR_METHOD_NOT_FOUND = -32601;
 const CDP_ERROR_SERVER = -32000;
@@ -263,16 +271,20 @@ export class RelayBridge {
 	#realSessionTabs = new Map<string, { tabKey: string; sessionId: string }>();
 	#log: (message: string, data?: Record<string, unknown>) => void;
 	#suppressBeforeUnload: boolean;
+	#rpcTimeoutMs: number;
 
 	constructor(
 		opts: {
 			log?: (message: string, data?: Record<string, unknown>) => void;
 			/** Install a page script on attached tabs that stops `beforeunload` prompts from stealing focus. */
 			suppressBeforeUnload?: boolean;
+			/** Deadline for one extension RPC; defaults to 20s. */
+			rpcTimeoutMs?: number;
 		} = {},
 	) {
 		this.#log = opts.log ?? (() => {});
 		this.#suppressBeforeUnload = opts.suppressBeforeUnload ?? false;
+		this.#rpcTimeoutMs = opts.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
 	}
 
 	/** True when attached tabs get the `beforeunload`-suppression script. */
@@ -374,7 +386,7 @@ export class RelayBridge {
 		this.#log("extension socket connected");
 	}
 
-	extClosed(socket: RelaySocket): void {
+	extClosed(socket: RelaySocket, reason: Error = new Error("relay extension disconnected")): void {
 		const instanceId = this.#socketInstance.get(socket);
 		if (instanceId === undefined) return;
 		this.#socketInstance.delete(socket);
@@ -382,7 +394,7 @@ export class RelayBridge {
 		if (!inst || inst.socket !== socket) return;
 		inst.socket = null;
 		if (!this.ready && this.#extensionSeen) this.#extensionGoneSince ??= Date.now();
-		this.#rejectPendingExtensionRpcs(instanceId, new Error("relay extension disconnected"));
+		this.#rejectPendingExtensionRpcs(instanceId, reason);
 		// Keep the instance's tabs listed (the browser may reconnect), but drop
 		// debugger state: the attachment died with the service worker.
 		for (const tab of this.#tabs.values()) {
@@ -436,6 +448,8 @@ export class RelayBridge {
 				this.#setWorkspace(inst, msg.windowId);
 				return;
 			case "rpcResult": {
+				// Even a late or failed result proves the extension is processing requests.
+				inst.consecutiveRpcTimeouts = 0;
 				const key = `${instanceId}:${msg.id}`;
 				const pending = this.#pendingRpc.get(key);
 				if (!pending) return;
@@ -498,6 +512,7 @@ export class RelayBridge {
 				socket: null,
 				info: null,
 				workspaceWindowId: null,
+				consecutiveRpcTimeouts: 0,
 			};
 			this.#instances.set(instanceId, inst);
 		} else if (inst.socket && inst.socket !== socket) {
@@ -521,6 +536,7 @@ export class RelayBridge {
 			inst.code = instanceCode(instanceId, msg.browserSession);
 		}
 		inst.socket = socket;
+		inst.consecutiveRpcTimeouts = 0;
 		this.#socketInstance.set(socket, instanceId);
 		inst.info = { userAgent: msg.userAgent, browserVersion: msg.browserVersion };
 		this.#setWorkspace(inst, msg.workspaceWindowId);
@@ -1492,7 +1508,28 @@ export class RelayBridge {
 		return inst;
 	}
 
-	#rpc(req: RelayRpcRequest, inst: ExtInstance, timeoutMs = RPC_TIMEOUT_MS): Promise<unknown> {
+	/** Fail an expired RPC. Enough deadlines in a row with no answer mean the extension is wedged, so force a reconnect. */
+	#expireRpc(
+		inst: ExtInstance,
+		socket: RelaySocket,
+		op: RelayRpcRequest["op"],
+		reject: (err: Error) => void,
+		message: string,
+	): void {
+		const wedged = inst.socket === socket && ++inst.consecutiveRpcTimeouts >= WEDGED_RPC_TIMEOUTS;
+		// A reset is transport churn, not the tab's fault: keep the tabs it interrupts retryable.
+		reject(wedged ? new ExtensionReplacedError(message) : new Error(message));
+		if (!wedged) return;
+		this.#log("extension rpc deadlines keep expiring; closing its socket to force a reconnect", {
+			instanceId: inst.instanceId,
+			op,
+			timeouts: inst.consecutiveRpcTimeouts,
+		});
+		this.extClosed(socket, new ExtensionReplacedError("relay reset an unresponsive extension"));
+		socket.close();
+	}
+
+	#rpc(req: RelayRpcRequest, inst: ExtInstance, timeoutMs = this.#rpcTimeoutMs): Promise<unknown> {
 		if (!inst.socket) return Promise.reject(new Error("relay extension is not connected"));
 		if (req.op !== "detach") {
 			if (req.op !== "createTab") {
@@ -1505,9 +1542,10 @@ export class RelayBridge {
 		}
 		const id = ++this.#rpcSeq;
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+		const socket = inst.socket;
 		const timer = setTimeout(() => {
 			this.#pendingRpc.delete(`${inst.instanceId}:${id}`);
-			reject(new Error(`extension rpc '${req.op}' timed out after ${timeoutMs}ms`));
+			this.#expireRpc(inst, socket, req.op, reject, `extension rpc '${req.op}' timed out after ${timeoutMs}ms`);
 		}, timeoutMs);
 		// Creation/removal may publish a lifecycle event before their RPC acknowledgement.
 		const tabKey = req.op === "createTab" || req.op === "removeTab" ? undefined : tabKeyOf(inst.code, req.tabId);
