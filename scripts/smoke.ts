@@ -336,29 +336,70 @@ try {
 	}
 	await extension.evaluate(async id => {
 		await chrome.debugger.attach({ tabId: id }, "1.3");
-		await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
-			expression: "document.querySelector('#field').focus()",
-		});
 	}, userId);
-	try {
-		if (nativeInput) {
-			await $`${xdotool} type --clearmodifiers --delay 15 ${"USER_INPUT_ONLY"}`.quiet();
-		} else {
-			await extension.evaluate(async id => {
-				await chrome.debugger.sendCommand({ tabId: id }, "Input.insertText", { text: "USER_INPUT_ONLY" });
-			}, userId);
+	type UserFieldState = { value: string; active: string | null; focused: boolean };
+	const readUserField = async (): Promise<UserFieldState> =>
+		extension.evaluate(async id => {
+			const response = await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
+				expression:
+					"({ value: document.querySelector('#field').value, active: document.activeElement?.id ?? null, focused: document.hasFocus() })",
+				returnByValue: true,
+			});
+			const result = response?.result;
+			if (
+				!result ||
+				typeof result !== "object" ||
+				!("value" in result) ||
+				!result.value ||
+				typeof result.value !== "object"
+			)
+				throw new Error("Outside-page observation failed");
+			return result.value as { value: string; active: string | null; focused: boolean };
+		}, userId);
+	const pollUserField = async (done: (state: UserFieldState) => boolean, timeoutMs: number) => {
+		const deadline = Date.now() + timeoutMs;
+		let state = await readUserField();
+		while (!done(state) && Date.now() < deadline) {
+			await Bun.sleep(20);
+			state = await readUserField();
 		}
-		await extension.waitForFunction(
-			async id => {
-				const response = await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
-					expression: "document.querySelector('#field').value",
-					returnByValue: true,
+		return state;
+	};
+	try {
+		// Native keystrokes are lost when they race Chrome's focus handoff, the one flaky step in CI. Re-arm focus and
+		// retry, logging each retry: a relay that really swallows user input fails every attempt, and a flake stays visible.
+		const attempts = 3;
+		let state: UserFieldState | undefined;
+		for (let attempt = 1; attempt <= attempts; attempt++) {
+			if (attempt > 1 && nativeInput) await $`${xdotool} windowactivate --sync ${nativeUserWindow!}`.quiet();
+			await extension.evaluate(async id => {
+				await chrome.debugger.sendCommand({ tabId: id }, "Runtime.evaluate", {
+					expression:
+						"(() => { const field = document.querySelector('#field'); field.value = ''; field.focus(); })()",
 				});
-				const result = response?.result;
-				return !!result && typeof result === "object" && "value" in result && result.value === "USER_INPUT_ONLY";
-			},
-			{ polling: 20, timeout: 5_000 },
-			userId,
+			}, userId);
+			// Do not type until the page itself reports the field focused (and, natively, the window focused).
+			const armed = await pollUserField(
+				current => current.active === "field" && (!nativeInput || current.focused),
+				2_000,
+			);
+			if (nativeInput) {
+				await $`${xdotool} type --clearmodifiers --delay 15 ${"USER_INPUT_ONLY"}`.quiet();
+			} else {
+				await extension.evaluate(async id => {
+					await chrome.debugger.sendCommand({ tabId: id }, "Input.insertText", { text: "USER_INPUT_ONLY" });
+				}, userId);
+			}
+			state = await pollUserField(current => current.value === "USER_INPUT_ONLY", 5_000);
+			if (state.value === "USER_INPUT_ONLY") break;
+			console.warn(
+				`smoke: user input attempt ${attempt}/${attempts} saw ${JSON.stringify(state)} after arming ${JSON.stringify(armed)}`,
+			);
+		}
+		assert.equal(
+			state?.value,
+			"USER_INPUT_ONLY",
+			`user input never reached the outside page in ${attempts} attempts: ${JSON.stringify(state)}`,
 		);
 	} finally {
 		await extension.evaluate(async id => {
