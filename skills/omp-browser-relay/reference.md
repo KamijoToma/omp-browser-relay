@@ -288,6 +288,43 @@ try {
 
 Do not blindly retry any side-effectful action, including clicks, typing, submissions, or drags: re-observe page state and ownership, then reconcile [partial progress](#4-preserve-partial-progress-reconcile-before-resuming) before explicitly continuing. A rejected or timed-out call may already have changed the page. If a tab moves out or disconnects, release can itself fail; report the actual error and do not substitute another target or native input. Use ordinary keyboard helpers for page typing and modifier keys, releasing held keys in `finally` too.
 
+## Command-line client
+
+`omp-browser-relay client` drives workspace pages from a shell or from any agent that can run commands. Prefer the stock helpers above when they work; use the client for interactions they cannot express:
+
+- trusted input **inside cross-origin iframes** (file pickers, embedded widgets, payment or login frames), where element handles do not reach and an accessibility snapshot shows nothing;
+- buttons that open a **native file chooser**, where you need to hand the page local files;
+- clients that only offer element-id clicks and cannot click by coordinate or by visible text.
+
+It is a convenience CLI, not an MCP server and not a JavaScript facade for the stock client. It connects to the same `/cdp` endpoint as any CDP client, so it reaches only the pages listed by `GET /json/list` and is bound by the same workspace scope. Input is the real CDP mouse/keyboard path: no synthetic DOM events, no OS input, no focus emulation.
+
+```sh
+omp-browser-relay client [--relay-url <url>] --list
+omp-browser-relay client [--relay-url <url>] <target> <command> [args...]
+```
+
+The relay URL is `--relay-url`, else `$OMP_BROWSER_RELAY_URL`, else `http://127.0.0.1:9224`; use the URL you configured for the service, not an assumed port. `<target>` is an exact page URL, a page id from `--list`, or a URL substring, tried in that order. Re-run `--list` after navigation: titles and URLs change, and another client or the user may have moved, closed or reused a tab.
+
+| Command | Effect |
+| --- | --- |
+| `info` | Viewport size, device pixel ratio, URL and title. |
+| `shot <out.png>` | Screenshot at **one image pixel per viewport CSS pixel**, so a coordinate read from the image can be passed straight to `click`. |
+| `where <text>` / `clicktext <text>` | Centre of, or a click on, the first visible, **unobscured** control in the main document whose text or `aria-label` equals `<text>` or ends with it (so icon-font prefixes are ignored). Not found means it may be inside an iframe: use `shot` and `click <x> <y>`. |
+| `click <x> <y>`, `dblclick <x> <y>`, `move <x> <y>`, `wheel <x> <y> <deltaY>` | Trusted mouse input at viewport CSS-pixel coordinates; the event is routed to whichever frame is under the point. |
+| `type <text>` | Inserts text (including non-ASCII) into the focused element, even inside an iframe. |
+| `key <Name[+Mod...]>` | `Enter`, `Tab`, `Escape`, arrows, single characters, with `Alt`/`Control`/`Meta`/`Shift`. On macOS `Meta+a/c/v/x/z` are sent with their editing commands, which CDP otherwise ignores. |
+| `eval <js>` | Evaluates an expression in the page and prints its JSON value. Use it for read-only postcondition checks and report booleans or counts, not page contents. |
+| `upload <x> <y> <file...>`, `uploadtext <text> <file...>` | Intercepts the native file chooser, clicks the button, and selects the files (several at once when the input is `multiple`). Files must exist; interception is always released afterwards so the user's own dialogs are not affected. `--chooser-timeout <ms>` (default 6000) bounds the wait. |
+
+Exit codes: `0` success, `1` runtime error (no matching page, unreachable relay, page error), `2` usage error, `3` no file chooser opened.
+
+Operating rules, in addition to the generic interaction policies:
+
+- Take a `shot` and read it before pointing at unfamiliar UI, wait out animations (dialogs fade in; a click during the transition can miss), and check the postcondition afterwards. A successful dispatch is not completion.
+- Keyboard focus inside an iframe is not reliable: the first `Tab` may reach a search box or a result card, and `Enter` on a card may open a preview instead of selecting it. Confirm where focus is with a `shot` before typing or pressing `Enter`; do not type blind.
+- `upload` sends local files to the site in the user's signed-in session. Upload only the files the user asked for, and list existing attachments first to avoid duplicates.
+- Never retry a side-effectful command blindly; re-observe and reconcile partial progress as described above.
+
 ## Screenshots, recording, errors, and exceptions
 
 Use the stock `tab.screenshot(...)` and, where present, `tab.recordStart(path, options)` / `tab.recordStop()` helpers. They capture the real owned page through the existing client/CDP path, not an unrelated foreground page or fabricated image. Recording remains a stock-client feature with its codec/runtime prerequisites (for example ffmpeg and appropriate encoders); transport support is not proof the local client has the dependencies. Inspect actual returned media/page state for acceptance. Do not claim MP4 or a codec was verified just because another format worked.

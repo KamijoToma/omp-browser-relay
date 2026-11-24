@@ -111,6 +111,19 @@ For component controls and repeated forms, the same reference covers explicit la
 
 When upgrading from 0.1, update both the service and extension, reload it in Chrome, and close any old reserved workspace tab. New workspaces have no reserved page.
 
+## Drive pages from the command line
+
+```sh
+omp-browser-relay client --relay-url http://127.0.0.1:9224 --list
+omp-browser-relay client --relay-url http://127.0.0.1:9224 <target> shot page.png
+omp-browser-relay client --relay-url http://127.0.0.1:9224 <target> clicktext "Add source"
+omp-browser-relay client --relay-url http://127.0.0.1:9224 <target> uploadtext "Upload files" ./a.pdf ./b.pdf
+```
+
+`client` is for the interactions that stock helpers and element-id tools cannot express: trusted clicks by coordinate or visible text (including inside cross-origin iframes such as file pickers), typing and key presses into the focused element, native file choosers, and screenshots whose pixels equal viewport CSS pixels. Set `OMP_BROWSER_RELAY_URL` to avoid repeating `--relay-url`.
+
+It is a convenience CLI, **not** an MCP server and not a JavaScript facade for the stock client. It talks to the same `/cdp` endpoint as any CDP client, so it reaches only the workspace pages the relay lists; it adds no synthetic DOM events, OS input or focus emulation. See the [command reference](skills/omp-browser-relay/reference.md#command-line-client) for every command, exit codes and operating rules.
+
 
 ## Window and input contract
 

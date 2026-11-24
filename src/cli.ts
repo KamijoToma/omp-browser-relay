@@ -3,17 +3,22 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { version } from "../package.json";
+import { runClient } from "./client";
 import { startRelayServer } from "./server";
 
 const HELP = `Usage: omp-browser-relay [serve] [--host <hostname>] [--port <port>] [--token <secret>] [--suppress-beforeunload] [--verbose]
        omp-browser-relay install [--dir <directory>]
        omp-browser-relay install-skill [--dir <directory>]
+       omp-browser-relay client [--relay-url <url>] --list | <target> <command> [args...]
        omp-browser-relay --help | --version
 
 Commands:
   serve          Listen for the Chrome extension and CDP clients (default: 127.0.0.1)
   install        Copy the built Chrome extension for loading as an unpacked extension
   install-skill  Copy the agent skill and canonical relay reference (opt-in)
+  client         Drive relay workspace pages with trusted CDP input: clicks by coordinate or text
+                 (also inside iframes), typing, keys, native file uploads, 1:1 screenshots.
+                 Run \`omp-browser-relay client --help\` for its commands.
 
 Discovery:
   GET /capabilities  Machine-readable support, readiness and policy
@@ -34,7 +39,9 @@ Options:
   --version   Show the package version`;
 
 interface CliOptions {
-	action: "serve" | "install" | "install-skill";
+	action: "serve" | "install" | "install-skill" | "client";
+	/** Arguments after `client`, parsed by the client itself. */
+	clientArgs: string[];
 	hostname: string;
 	port: number;
 	token?: string;
@@ -48,6 +55,7 @@ interface CliOptions {
 function parseArgs(argv: string[]): CliOptions {
 	const options: CliOptions = {
 		action: "serve",
+		clientArgs: [],
 		hostname: "127.0.0.1",
 		port: 9224,
 		suppressBeforeUnload: false,
@@ -56,6 +64,12 @@ function parseArgs(argv: string[]): CliOptions {
 		showVersion: false,
 	};
 	const args = [...argv];
+	if (args[0] === "client") {
+		// The client's own flags and free-form arguments (text to type, JavaScript) are not relay options.
+		options.action = "client";
+		options.clientArgs = args.slice(1);
+		return options;
+	}
 	if (args[0] === "serve" || args[0] === "install" || args[0] === "install-skill") {
 		options.action = args.shift() as CliOptions["action"];
 	}
@@ -102,6 +116,10 @@ function parseArgs(argv: string[]): CliOptions {
 
 async function main(): Promise<void> {
 	const options = parseArgs(Bun.argv.slice(2));
+	if (options.action === "client") {
+		process.exitCode = await runClient(options.clientArgs);
+		return;
+	}
 	if (options.help) {
 		console.log(HELP);
 		return;

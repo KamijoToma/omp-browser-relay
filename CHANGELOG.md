@@ -15,6 +15,7 @@
 - Added shared-control, migration, cancellation, native-view and last-business-tab lifecycle regressions.
 - Added generic interaction guidance for actionable targets, scoped forms, DOM postconditions, partial-progress recovery, and minimum disclosure using stock browser APIs.
 - Added framework-free interaction acceptance scenarios to the modern and legacy original-client drivers.
+- Added an `omp-browser-relay client` command for trusted CDP input the stock helpers and element-id tools cannot express: clicks by coordinate or visible text (including inside cross-origin iframes), text and key input with macOS editing shortcuts, native file-chooser uploads that always release their interception, and screenshots at one image pixel per CSS pixel. It only reaches workspace pages through the existing `/cdp` endpoint and adds no MCP server or JavaScript facade; documented in the README, `SKILL.md` and the canonical reference.
 
 - Added configurable relay bind hostname with a loopback default and Tailscale/firewall guidance for remote CDP access.
 - Added an opt-in `--suppress-beforeunload` serve option that installs a page script on attached tabs so `beforeunload` handlers are never registered, preventing Chrome's focus-stealing "Leave site?" prompt when automation navigates away from editors or forms. It is reported as `pageIntervention.suppressBeforeUnload` in `/capabilities`, off by default, and does not change `backgroundNativeFocusIsolation`.
